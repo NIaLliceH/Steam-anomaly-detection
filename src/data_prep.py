@@ -15,7 +15,7 @@ logging.basicConfig(
 )
 log = logging.getLogger(__name__)
 
-RAW_DIR = os.path.join(os.path.dirname(__file__), "..", "raw-dataset")
+RAW_DIR = os.path.join(os.path.dirname(__file__), "..", "data", "raw")
 PROCESSED_DIR = os.path.join(os.path.dirname(__file__), "..", "data", "processed")
 
 
@@ -46,7 +46,7 @@ def load_private_ids() -> set:
     df = pd.read_csv(
         _raw("private_steamids.csv"),
         usecols=["playerid"],
-        dtype={"playerid": "int32"},
+        dtype={"playerid": "int64"},
     )
     private = set(df["playerid"].tolist())
     log.info("  %d private player IDs loaded.", len(private))
@@ -58,7 +58,7 @@ def load_history(private_ids: set) -> pd.DataFrame:
     df = pd.read_csv(
         _raw("history.csv"),
         usecols=["playerid", "achievementid", "date_acquired"],
-        dtype={"playerid": "int32", "achievementid": "string"},
+        dtype={"playerid": "int64", "achievementid": "string"},
     )
     log.info("  Raw rows: %d", len(df))
 
@@ -78,6 +78,11 @@ def load_history(private_ids: set) -> pd.DataFrame:
     before = len(df)
     df = df[~df["playerid"].isin(private_ids)].reset_index(drop=True)
     log.info("  Removed %d rows belonging to private players.", before - len(df))
+
+    # Remove duplicates
+    before = len(df)
+    df = df.drop_duplicates(subset=["playerid", "achievementid", "date_acquired"], keep="first").reset_index(drop=True)
+    log.info("  Removed %d duplicate rows.", before - len(df))
     log.info("  Final rows: %d", len(df))
     return df
 
@@ -87,7 +92,7 @@ def load_players(private_ids: set) -> pd.DataFrame:
     df = pd.read_csv(
         _raw("players.csv"),
         usecols=["playerid", "country", "created"],
-        dtype={"playerid": "int32", "country": "category"},
+        dtype={"playerid": "int64", "country": "category"},
     )
     log.info("  Raw rows: %d", len(df))
 
@@ -98,6 +103,11 @@ def load_players(private_ids: set) -> pd.DataFrame:
     before = len(df)
     df = df[~df["playerid"].isin(private_ids)].reset_index(drop=True)
     log.info("  Removed %d private players.", before - len(df))
+
+    # Remove duplicates
+    before = len(df)
+    df = df.drop_duplicates(subset=["playerid"], keep="first").reset_index(drop=True)
+    log.info("  Removed %d duplicate rows.", before - len(df))
     log.info("  Final rows: %d", len(df))
     return df
 
@@ -109,7 +119,7 @@ def load_reviews(private_ids: set) -> pd.DataFrame:
         usecols=["reviewid", "playerid", "gameid", "review", "helpful", "funny", "awards", "posted"],
         dtype={
             "reviewid": "int32",
-            "playerid": "int32",
+            "playerid": "int64",
             "gameid": "int32",
             "helpful": "int32",
             "funny": "int32",
@@ -124,6 +134,11 @@ def load_reviews(private_ids: set) -> pd.DataFrame:
     before = len(df)
     df = df[~df["playerid"].isin(private_ids)].reset_index(drop=True)
     log.info("  Removed %d rows belonging to private players.", before - len(df))
+
+    # Remove duplicates
+    before = len(df)
+    df = df.drop_duplicates(subset=["reviewid"], keep="first").reset_index(drop=True)
+    log.info("  Removed %d duplicate rows.", before - len(df))
     log.info("  Final rows: %d", len(df))
     return df
 
@@ -133,7 +148,7 @@ def load_purchased(private_ids: set) -> pd.DataFrame:
     df = pd.read_csv(
         _raw("purchased_games.csv"),
         usecols=["playerid", "library"],
-        dtype={"playerid": "int32", "library": "string"},
+        dtype={"playerid": "int64", "library": "string"},
     )
     log.info("  Raw rows: %d", len(df))
 
@@ -144,6 +159,11 @@ def load_purchased(private_ids: set) -> pd.DataFrame:
     before = len(df)
     df = df[~df["playerid"].isin(private_ids)].reset_index(drop=True)
     log.info("  Removed %d private players.", before - len(df))
+
+    # Remove duplicates
+    before = len(df)
+    df = df.drop_duplicates(subset=["playerid"], keep="first").reset_index(drop=True)
+    log.info("  Removed %d duplicate rows.", before - len(df))
     log.info("  Final rows: %d", len(df))
     return df
 

@@ -1,0 +1,128 @@
+(btl-p4aiNds) mbelin@humanity:~/hcmut/p4aiNds/btl$ python3 batch_analysis.py
+=== 1. INJECTING NEW DATA ===
+[+] Injected 4 records into players.csv
+[+] Moved players.csv to data/archive/20260403_144623/
+[+] Injected 4 records into purchased_games.csv
+[+] Moved purchased_games.csv to data/archive/20260403_144623/
+[+] Injected 8707 records into history.csv
+[+] Moved history.csv to data/archive/20260403_144623/
+[+] Injected 29 records into reviews.csv
+[+] Moved reviews.csv to data/archive/20260403_144626/
+
+=== 2. RUNNING AI PIPELINE (Please wait...) ===
+[*] Running Phase 1 (Data Prep)...
+14:46:30 [INFO] Output directory: /home/mbelin/hcmut/p4aiNds/btl/data/processed
+14:46:30 [INFO] Loading private Steam IDs …
+14:46:30 [INFO]   227963 private player IDs loaded.
+14:46:30 [INFO] Loading history.csv (~647 MB) …
+14:46:36 [INFO]   Raw rows: 10702586
+14:46:46 [INFO]   Removed 1436803 rows belonging to private players.
+14:46:49 [INFO]   Removed 0 duplicate rows.
+14:46:49 [INFO]   Final rows: 9265783
+14:46:49 [INFO] Loading players.csv …
+14:46:49 [INFO]   Raw rows: 424687
+14:46:49 [INFO]   Removed 227963 private players.
+14:46:49 [INFO]   Removed 0 duplicate rows.
+14:46:49 [INFO]   Final rows: 196724
+14:46:49 [INFO] Loading reviews.csv (~551 MB) …
+14:46:53 [INFO]   Raw rows: 1204563
+14:46:53 [INFO]   Removed 0 rows belonging to private players.
+14:46:53 [INFO]   Removed 0 duplicate rows.
+14:46:53 [INFO]   Final rows: 1204563
+14:46:53 [INFO] Loading purchased_games.csv …
+14:46:54 [INFO]   Raw rows: 102552
+14:46:55 [INFO]   Removed 52712 private players.
+14:46:55 [INFO]   Removed 0 duplicate rows.
+14:46:55 [INFO]   Final rows: 49840
+14:46:56 [INFO] Saved history.parquet  (102.8 MB,  9265783 rows)
+14:46:56 [INFO] Saved players.parquet  (2.9 MB,  196724 rows)
+14:46:58 [INFO] Saved reviews.parquet  (294.5 MB,  1204563 rows)
+14:46:59 [INFO] Saved purchased.parquet  (19.1 MB,  49840 rows)
+14:46:59 [INFO] Phase 1 complete.
+[*] Running Phase 2 (Anomaly Detection Model)...
+14:47:01 [INFO] Loading processed parquet files from /home/mbelin/hcmut/p4aiNds/btl/data/processed …
+14:47:03 [INFO]   history:   9265783 rows  |  columns: ['playerid', 'achievementid', 'date_acquired', 'gameid']
+14:47:03 [INFO]   players:   196724 rows  |  columns: ['playerid', 'country', 'created']
+14:47:03 [INFO]   reviews:   1204563 rows  |  columns: ['reviewid', 'playerid', 'gameid', 'review', 'helpful', 'funny', 'awards', 'posted']
+14:47:03 [INFO]   purchased: 49840 rows  |  columns: ['playerid', 'library', 'library_size']
+14:47:04 [INFO] Building player library lookup …
+14:47:06 [INFO] Step 2 — Building heuristic labels …
+14:47:10 [INFO]   Computing unowned_ratio for 196700 players with reviews …
+14:49:34 [INFO]   Heuristic bots: 194323 (98.79%)
+14:49:34 [INFO] Saved → /home/mbelin/hcmut/p4aiNds/btl/outputs/heuristic_labels.csv
+14:49:34 [INFO] Step 3 — Building feature matrix …
+14:49:35 [INFO]   Group A: speed features …
+14:49:41 [INFO]   Group B: temporal features …
+14:49:44 [INFO]   Group C: diversity features …
+14:49:49 [INFO]   Group D: review features …
+/home/mbelin/hcmut/p4aiNds/btl/src/features.py:242: FutureWarning: DataFrameGroupBy.apply operated on the grouping columns. This behavior is deprecated, and in a future version of pandas the grouping columns will be excluded from the operation. Either pass `include_groups=False` to exclude the groupings or explicitly select the grouping columns after groupby to silence this warning.
+  .apply(unowned_ratio_fn)
+14:51:15 [INFO]   Bonus: account age features …
+14:51:16 [INFO]   Feature matrix: 196701 players × 25 features
+14:51:17 [INFO] Saved → /home/mbelin/hcmut/p4aiNds/btl/outputs/feature_matrix.csv
+14:51:17 [INFO] Common players for modelling: 196701
+14:51:17 [INFO] Step 4 — Preprocessing (MedianImputer + RobustScaler) …
+14:51:17 [INFO]   Preprocessor saved → /home/mbelin/hcmut/p4aiNds/btl/outputs/preprocessor.pkl
+14:51:17 [INFO] Step 5 — Hyperparameter tuning …
+14:51:17 [INFO]   Tuning IsolationForest (54 param combos) …
+14:57:58 [INFO]     Best IF  ROC-AUC=0.0052  {'contamination': 0.02, 'max_features': 1.0, 'max_samples': 'auto', 'n_estimators': 200, 'random_state': 42}
+14:57:58 [INFO]   Tuning LOF (novelty=True, sample=20000) …
+14:59:52 [INFO]     Best LOF ROC-AUC=0.5506  {'contamination': 0.02, 'metric': 'manhattan', 'n_neighbors': 10}
+14:59:52 [INFO]   Tuning OneClassSVM (sample=20000) …
+15:03:24 [INFO]     Best SVM ROC-AUC=0.2306  {'gamma': 'scale', 'kernel': 'rbf', 'nu': 0.01}
+15:03:24 [INFO] Saved → /home/mbelin/hcmut/p4aiNds/btl/outputs/tuning_results.csv
+15:03:24 [INFO] Step 6 — Training final models …
+15:03:24 [INFO]   IsolationForest …
+15:03:27 [INFO]   LOF …
+15:03:32 [INFO]   OneClassSVM …
+15:03:35 [INFO] Step 7 — Building ensemble …
+15:03:35 [INFO]   Anomalies flagged: 6941 (3.53%)
+15:03:36 [INFO] Saved → /home/mbelin/hcmut/p4aiNds/btl/outputs/ensemble_results.csv
+15:03:36 [INFO] Step 8 — Evaluation …
+15:03:36 [INFO]   ROC-AUC IsolationForest  0.0052
+15:03:36 [INFO]   ROC-AUC LOF              0.5506
+15:03:36 [INFO]   ROC-AUC OCSVM            0.2306
+15:03:36 [INFO]   ROC-AUC Ensemble         0.1303
+15:03:36 [INFO]   Precision@100   (Ensemble) 0.4800
+15:03:36 [INFO]   Precision@500   (Ensemble) 0.7360
+15:03:36 [INFO]   Precision@1000  (Ensemble) 0.7740
+15:03:36 [INFO] 
+                 ROC-AUC  Flagged Rate %  Precision@100  Precision@500  Precision@1000
+IsolationForest   0.0052          5.0005           0.81          0.664           0.567
+LOF               0.5506          5.0005           1.00          1.000           1.000
+OCSVM             0.2306          5.0005           0.26          0.164           0.200
+Ensemble          0.1303          3.5287           0.48          0.736           0.774
+15:03:36 [INFO] 
+Top-50 Flagged vs Normal:
+                               Flagged (mean)  Normal (mean)     Ratio
+median_unlock_interval_sec        5179921.479       9191.884   563.532
+min_unlock_interval_sec            851825.542         15.469  55067.97
+std_unlock_interval_sec           27872648.35    2770651.731     10.06
+cv_unlock_interval                      5.732          6.761     0.848
+max_achievements_per_minute             547.8        306.968     1.785
+max_achievements_per_day              4716.52        790.296     5.968
+night_activity_ratio                    0.356          0.293     1.213
+hour_entropy                            1.516          2.487      0.61
+activity_density                        0.098          0.101     0.976
+weekend_ratio                            0.28          0.329     0.852
+total_achievements                   17049.32       2665.817     6.396
+games_with_achievements                 26.02         72.263      0.36
+library_size                           145.88        193.776     0.753
+achievement_game_ratio                  0.317          0.378     0.838
+top1_game_concentration                 0.618          0.265     2.336
+top3_game_concentration                 0.917           0.45     2.036
+game_hhi                                0.523           0.16     3.278
+avg_achievements_per_game                40.2          32.65     1.231
+total_reviews                            4.14          6.124     0.676
+review_unowned_ratio                    0.123          0.861     0.143
+review_duplication_rate                 0.019           0.01     1.929
+avg_review_length                     129.251        151.664     0.852
+min_review_length                      106.44         62.271     1.709
+days_before_first_achievement          840.66        419.649     2.003
+account_age_days                      3428.46       4199.014     0.816
+15:03:36 [INFO] Step 9 — SHAP explanations …
+15:03:36 [INFO]   Computing SHAP values on 10000 samples …
+15:03:46 [INFO]   Saved shap_summary.png
+15:03:46 [INFO]   Saved shap_waterfall.png
+15:03:47 [INFO]   Saved SHAP scatter plots for: ['review_unowned_ratio', 'account_age_days', 'min_review_length']
+15:03:47 [INFO] Pipeline complete. All outputs in /home/mbelin/hcmut/p4aiNds/btl/outputs/
