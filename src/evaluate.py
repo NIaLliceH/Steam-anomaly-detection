@@ -48,8 +48,6 @@ def _model_comparison(y_heuristic: pd.Series,
     score_map = {
         "XGBoost":         percentile_scores.get("xgb_pct", np.zeros(len(y_heuristic))),
         "IsolationForest": percentile_scores["if_pct"],
-        "LOF":             percentile_scores["lof_pct"],
-        "OCSVM":           percentile_scores["svm_pct"],
         "Ensemble":        percentile_scores["composite"],
     }
 
@@ -260,8 +258,6 @@ def evaluate(ensemble_results: pd.DataFrame,
     score_map = {
         "XGBoost":         percentile_scores.get("xgb_pct"),
         "IsolationForest": percentile_scores["if_pct"],
-        "LOF":             percentile_scores["lof_pct"],
-        "OCSVM":           percentile_scores["svm_pct"],
         "Ensemble":        composite,
     }
     for model, scores in score_map.items():

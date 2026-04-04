@@ -2,14 +2,14 @@
 Steam Anomaly Detection — Main Pipeline Orchestrator (V2)
 Executes Steps 2–9. Step 1 (data prep) is handled by src/data_prep.py.
 
-V2 pipeline order:
-  2. Heuristic Labels V2    (AND logic, 3 bot archetypes, Bug #3 fix)
-  3. Feature Engineering    (Bug #2 fix: int-safe library lookup)
-  4. Preprocessing          (Imputer + RobustScaler + PCA 90%)
-  5a. Unsupervised tuning   (IF / LOF / OCSVM grid search)
-  5b. XGBoost training      (semi-supervised, RandomizedSearchCV, PRIMARY)
-  6. Final unsupervised     (retrain on full data)
-  7. Ensemble V2            (XGB=0.50, LOF=0.30, IF=0.15+flip-if-inverted, SVM=0.05)
+V3 "Dynamic Duo" pipeline:
+  2. Heuristic Labels V2    (AND logic, 3 bot archetypes)
+  3. Feature Engineering    (int-safe library lookup, NaN for missing library)
+  4. Preprocessing          (Imputer + StandardScaler + PCA 90%)
+  5a. IF tuning             (grid search on IsolationForest only)
+  5b. XGBoost training      (semi-supervised PU Learning, PRIMARY)
+  6. Final IF training      (retrain on full data)
+  7. Ensemble V3            (XGB=0.80, IF=0.20+auto-flip, threshold=85)
   8-9. Evaluation + SHAP    (XGBoost-based SHAP, PR-AUC, feature importance)
 """
 
@@ -125,10 +125,8 @@ def main() -> None:
         X_log, save_path=os.path.join(OUTPUTS_DIR, "preprocessor.pkl")
     )
 
-    # ── Step 5a: Hyperparameter Tuning (unsupervised) ─────────────────────────
-    best_if_params, best_lof_params, best_svm_params, tuning_results = tune_models(
-        X_scaled, y_heuristic
-    )
+    # ── Step 5a: Hyperparameter Tuning (IsolationForest) ─────────────────────
+    best_if_params, tuning_results = tune_models(X_scaled, y_heuristic)
     tuning_path = os.path.join(OUTPUTS_DIR, "tuning_results.csv")
     tuning_results.to_csv(tuning_path, index=False)
     log.info("Saved → %s", tuning_path)
@@ -139,9 +137,7 @@ def main() -> None:
     )
 
     # ── Step 6: Train Final Unsupervised Models ───────────────────────────────
-    _, scores = train_best_models(
-        X_scaled, best_if_params, best_lof_params, best_svm_params
-    )
+    _, scores = train_best_models(X_scaled, best_if_params)
 
     # ── Step 7: Ensemble V2 ───────────────────────────────────────────────────
     ensemble_results, percentile_scores = build_ensemble(

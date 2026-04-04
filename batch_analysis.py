@@ -178,8 +178,6 @@ def build_report_data(target_ids):
             'is_bot': is_bot,
             'status': "ANOMALY DETECTED (BOT/FRAUD)" if is_bot else "NORMAL PLAYER",
             'if_pct': res.iloc[0]['if_pct'],
-            'lof_pct': res.iloc[0]['lof_pct'],
-            'svm_pct': res.iloc[0]['svm_pct'],
             'max_achievements_per_day': user_feat.get('max_achievements_per_day', 0),
             'normal_avg_achievements': normal_mean['max_achievements_per_day'],
             'review_unowned_ratio': user_feat.get('review_unowned_ratio', 0),
@@ -214,10 +212,8 @@ def generate_markdown_report(target_ids):
         status_icon = "🚨" if entry['is_bot'] else "✅"
         md += f"**Status:** {status_icon} {entry['status']}\n\n"
         md += f"**AI Suspicion Score:** {entry['score']:.2f} / 100\n\n"
-        md += f"**Model Votes:**\n"
-        md += f"- Isolation Forest: {entry['if_pct']:.1f}%\n"
-        md += f"- Local Outlier Factor: {entry['lof_pct']:.1f}%\n"
-        md += f"- SVM: {entry['svm_pct']:.1f}%\n\n"
+        md += f"**Model Scores:**\n"
+        md += f"- Isolation Forest: {entry['if_pct']:.1f}%\n\n"
         
         if entry['is_bot']:
             md += "### Behavior Evidence (Why flagged?)\n\n"
@@ -418,8 +414,6 @@ def generate_html_report(target_ids):
         html += f'<div class="score-display">{entry["score"]:.2f}</div>\n'
         html += '<div class="model-votes">\n'
         html += f'<div class="vote-item"><div class="vote-label">Isolation Forest</div><div class="vote-percent">{entry["if_pct"]:.1f}%</div></div>\n'
-        html += f'<div class="vote-item"><div class="vote-label">Local Outlier Factor</div><div class="vote-percent">{entry["lof_pct"]:.1f}%</div></div>\n'
-        html += f'<div class="vote-item"><div class="vote-label">SVM</div><div class="vote-percent">{entry["svm_pct"]:.1f}%</div></div>\n'
         html += '</div>\n</div>\n'
         
         if entry['is_bot']:
@@ -484,7 +478,7 @@ def generate_report(target_ids, output_format='console'):
             print(f"\nSTEAM ID: {pid}")
             print(f"   Status: {status}")
             print(f"   AI Suspicion Score: {score:.2f} / 100")
-            print(f"   Model Votes: IF={entry['if_pct']:.1f}%, LOF={entry['lof_pct']:.1f}%, SVM={entry['svm_pct']:.1f}%")
+            print(f"   Model Scores: IF={entry['if_pct']:.1f}%")
             
             if entry['is_bot']:
                 print("   BEHAVIOR EVIDENCE (Why flagged?):")
@@ -527,6 +521,7 @@ Examples:
   python3 batch_analysis.py                           # Full pipeline (if new data exists)
   python3 batch_analysis.py --query-only              # Skip injection, query existing results only
   python3 batch_analysis.py --query-only --steam-ids 123 456  # Query specific player IDs
+  python3 batch_analysis.py --force-run               # Force run pipeline even without new data
         """
     )
     
@@ -550,6 +545,12 @@ Examples:
         help='Report output format (default: all)'
     )
     
+    parser.add_argument(
+        '--force-run',
+        action='store_true',
+        help='Force run the entire pipeline even if no new data is injected'
+    )
+    
     args = parser.parse_args()
     
     # Determine target IDs
@@ -564,7 +565,7 @@ Examples:
         # Inject data and check if anything was injected
         data_injected = inject_crawled_data()
         
-        if data_injected:
+        if data_injected or args.force_run:
             print("\n=== 2. RUNNING AI PIPELINE (Please wait...) ===")
             print("[*] Running Phase 1 (Data Prep)...")
             subprocess.run(["python3", "src/data_prep.py"], check=True)
