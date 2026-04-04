@@ -1,10 +1,10 @@
-import sys
 import requests
 import pandas as pd
 from datetime import datetime
 import time
 import os
 import csv
+import argparse
 from dotenv import load_dotenv
 from bs4 import BeautifulSoup
 import re
@@ -17,10 +17,14 @@ import re
 load_dotenv()
 API_KEY = os.getenv("API_KEY")
 STEAM_IDS = [
-    76561198287996067,
-    76561199761358443,
-    76561198399223263,
-    76561198350357346
+    # 76561198287996067,
+    # 76561199761358443,
+    # 76561198399223263,
+    # 76561198350357346
+    76561198405841744,
+    76561198354838543,
+    76561198391038255,
+    76561198147116758
 ]
 OUTPUT_DIR = "data/crawled"
 
@@ -240,51 +244,120 @@ def parse_steam_date(date_str):
 # MAIN EXECUTION
 # ==========================================
 
+def parse_arguments():
+    """Parse command-line arguments for Steam IDs and data types to crawl"""
+    parser = argparse.ArgumentParser(
+        description="Steam Data Crawler - Scrape Steam profiles for player data",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  python3 steam_crawling.py                           # Use default STEAM_IDS, crawl all data
+  python3 steam_crawling.py 76561198405841744         # Crawl specific Steam ID, all data types
+  python3 steam_crawling.py --steam-ids 123 456 789   # Crawl multiple Steam IDs with --steam-ids
+  python3 steam_crawling.py --data reviews             # Crawl only reviews (uses default STEAM_IDS)
+  python3 steam_crawling.py 123 --data reviews         # Crawl reviews for specific Steam ID
+  python3 steam_crawling.py --data players,reviews     # Crawl players and reviews only
+        """
+    )
+    
+    parser.add_argument(
+        'steam_ids',
+        nargs='*',
+        type=int,
+        help='Steam IDs to crawl (if not provided, uses default STEAM_IDS from config)'
+    )
+    
+    parser.add_argument(
+        '--steam-ids',
+        nargs='+',
+        type=int,
+        dest='steam_ids_flag',
+        help='Alternative way to specify Steam IDs'
+    )
+    
+    parser.add_argument(
+        '--data',
+        type=str,
+        default='players,purchased_games,history,reviews',
+        help='Comma-separated list of data types to crawl: players, purchased_games, history, reviews (default: all)'
+    )
+    
+    args = parser.parse_args()
+    
+    # Determine which Steam IDs to use
+    steam_ids = args.steam_ids_flag or args.steam_ids or None
+    
+    # Parse data types
+    data_types = set(d.strip() for d in args.data.split(','))
+    
+    # Validate data types
+    valid_types = {'players', 'purchased_games', 'history', 'reviews'}
+    invalid_types = data_types - valid_types
+    if invalid_types:
+        parser.error(f"Invalid data types: {', '.join(invalid_types)}. Valid options: {', '.join(valid_types)}")
+    
+    return steam_ids, data_types
+
 if __name__ == "__main__":
-    if len(sys.argv) > 1:
-        STEAM_IDS = [int(arg) for arg in sys.argv[1:]]
+    steam_ids_arg, data_types = parse_arguments()
+    
+    # Use provided Steam IDs or fall back to default
+    if steam_ids_arg:
+        STEAM_IDS = steam_ids_arg
         
     print("[?] Using VPN is recommended because Steam is blocked in this region.")
     print(f"[*] Starting Steam Data Crawler for {len(STEAM_IDS)} target accounts...")
+    print(f"[*] Data types to crawl: {', '.join(sorted(data_types))}\n")
     
     for STEAM_ID in STEAM_IDS:
         print(f"\n\n=== STEAM DATA CRAWLER FOR {STEAM_ID} ===")
         
-        # skip crawling if steam_id already exists in players.csv to avoid duplicates
-        if is_already_crawled(STEAM_ID):
-            print(f"[*] This STEAM_ID has already been crawled.")
-            continue
-            
         # 1. Players
-        df_players = crawl_player_info(STEAM_ID)
-        # if player info is None, it likely means the profile is private or invalid.
-        if df_players is None:
-            print("[-] Stopping further crawling due to private/invalid profile.")
-            continue
+        if 'players' in data_types:
+            # skip crawling if steam_id already exists in players.csv to avoid duplicates
+            if is_already_crawled(STEAM_ID):
+                print(f"[*] This STEAM_ID has already been crawled (in players.csv).")
+            else:
+                df_players = crawl_player_info(STEAM_ID)
+                # if player info is None, it likely means the profile is private or invalid.
+                if df_players is None:
+                    print("[-] Stopping further crawling due to private/invalid profile.")
+                    continue
+                else:
+                    save_append(df_players, "players.csv")
         else:
-            save_append(df_players, "players.csv")
-        
+            print("[*] Skipping players data.")
             
         # 2. Purchased Games
-        df_purchased, app_ids = crawl_library(STEAM_ID)
-        if df_purchased is not None: save_append(df_purchased, "purchased_games.csv")
+        app_ids = []
+        if 'purchased_games' in data_types:
+            df_purchased, app_ids = crawl_library(STEAM_ID)
+            if df_purchased is not None: 
+                save_append(df_purchased, "purchased_games.csv")
+        else:
+            print("[*] Skipping purchased_games data.")
             
-        # 3. History
-        if app_ids:
-            df_history = crawl_achievements(STEAM_ID, app_ids)
-            if not df_history.empty:
-                save_append(df_history, "history.csv")
-                print(f"    -> Found {len(df_history)} unlocked achievements!")
+        # 3. History (Achievements)
+        if 'history' in data_types:
+            if app_ids:
+                df_history = crawl_achievements(STEAM_ID, app_ids)
+                if not df_history.empty:
+                    save_append(df_history, "history.csv")
+                    print(f"    -> Found {len(df_history)} unlocked achievements!")
+                else:
+                    print("    -> No achievements found.")
+                    df_empty = pd.DataFrame(columns=["playerid", "achievementid", "date_accquired"])
+                    save_append(df_empty, "history.csv")
             else:
-                print("    -> No achievements found.")
-                df_empty = pd.DataFrame(columns=["playerid", "achievementid", "date_accquired"])
-                save_append(df_empty, "history.csv")
+                print("[*] Skipping history data (no app IDs available).")
+        else:
+            print("[*] Skipping history data.")
                 
-        # 5. Reviews (Đã nâng cấp)
-        df_reviews = crawl_reviews(STEAM_ID)
-        save_append(df_reviews, "reviews.csv")
-    
-        # 6. Private IDs (Vẫn giữ mock rỗng để AI Pipeline không lỗi)
-        # save_append(pd.DataFrame(columns=["playerid"]), "private_steamids.csv")
+        # 4. Reviews
+        if 'reviews' in data_types:
+            df_reviews = crawl_reviews(STEAM_ID)
+            save_append(df_reviews, "reviews.csv")
+        else:
+            print("[*] Skipping reviews data.")
 
-        print(f"[v] Appended data for {STEAM_ID} to '{OUTPUT_DIR}'.\n")
+        print(f"[v] Finished processing {STEAM_ID}.\n")

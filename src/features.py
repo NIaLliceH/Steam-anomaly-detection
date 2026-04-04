@@ -29,11 +29,20 @@ def add_time_components(history: pd.DataFrame) -> pd.DataFrame:
 
 
 def build_player_library(purchased: pd.DataFrame) -> dict:
-    """Return {playerid: set(gameid)} for O(1) library membership checks."""
-    return {
-        pid: set(lib) if lib is not None else set()
-        for pid, lib in zip(purchased["playerid"], purchased["library"])
-    }
+    """
+    Return {playerid (int): set(gameid (int))} for O(1) library membership checks.
+
+    Explicit int conversion prevents type mismatch between library items (may be
+    stored as str in parquet) and reviews.gameid (int) — without this, isin()
+    always returns False, causing review_unowned_ratio = 1.0 for every player.
+    """
+    result = {}
+    for pid, lib in zip(purchased["playerid"], purchased["library"]):
+        if lib is None:
+            result[int(pid)] = set()
+        else:
+            result[int(pid)] = {int(g) for g in lib if g is not None}
+    return result
 
 
 # ---------------------------------------------------------------------------
@@ -44,74 +53,124 @@ def build_heuristic_labels(history: pd.DataFrame,
                             reviews: pd.DataFrame,
                             player_library: dict) -> pd.DataFrame:
     """
-    Create pseudo ground truth (heuristic_bot = 0/1) using 5 rules.
-    Must be called before build_feature_matrix to keep the pipeline order
-    explicit (avoids accidentally reusing fully-engineered features).
+    Create pseudo ground truth (heuristic_bot = 0/1) using 3 AND-rule groups.
+
+    V2 changes vs V1:
+    - OR logic → AND logic per group to reduce false positives.
+      V1's OR rules flagged 98%+ of players; AND rules target only clear bots.
+    - 3 distinct bot archetypes: Speed bot, Volume bot, Review bot.
+    - unowned_ratio uses explicit int() casts (Bug #2 fix).
     """
     log.info("Step 2 — Building heuristic labels …")
 
-    # Rule 1: Median unlock interval < 2 seconds
-    speed_stats = (
+    # ── Speed stats ──────────────────────────────────────────────────────────
+    diffs = (
         history.sort_values(["playerid", "date_acquired"])
         .groupby("playerid")["date_acquired"]
-        .apply(lambda x: x.diff().dt.total_seconds().median())
-        .rename("median_interval")
+        .apply(lambda x: x.diff().dt.total_seconds())
     )
+    median_interval = diffs.groupby(level=0).median().rename("median_interval")
+    min_interval    = diffs.groupby(level=0).min().rename("min_interval")
 
-    # Rule 2: Top-1 game concentration > 0.90
+    # ── Game concentration ────────────────────────────────────────────────────
     top1_conc = (
-        history.groupby(["playerid", "gameid"])
-        .size()
-        .groupby(level=0)
-        .apply(lambda x: x.max() / x.sum())
+        history.groupby(["playerid", "gameid"]).size()
+        .groupby(level=0).apply(lambda x: x.max() / x.sum())
         .rename("top1_concentration")
     )
 
-    # Rule 3: Max achievements / day > 500
+    # ── Max achievements per day ──────────────────────────────────────────────
     max_per_day = (
-        history.groupby(["playerid", "date_only"])
-        .size()
+        history.groupby(["playerid", "date_only"]).size()
         .groupby(level=0).max()
         .rename("max_per_day")
     )
 
-    # Rules 4 & 5: Review-behaviour signals
-    review_counts = reviews.groupby("playerid").size().rename("review_count")
-    ach_counts    = history.groupby("playerid").size().rename("ach_count")
+    # ── Night activity ratio (00:00–05:59) ────────────────────────────────────
+    night_ratio = (
+        history.assign(is_night=(history["hour"] < 6))
+        .groupby("playerid")["is_night"].mean()
+        .rename("night_ratio")
+    )
 
-    # Unowned ratio: fraction of reviews for games not in the player's library
+    # ── Achievement and review counts ─────────────────────────────────────────
+    ach_counts    = history.groupby("playerid").size().rename("ach_count")
+    review_counts = reviews.groupby("playerid").size().rename("review_count")
+
+    # ── Unowned ratio (vectorised groupby — faster than row-level loop) ───────
     players_with_reviews = reviews["playerid"].unique()
     log.info("  Computing unowned_ratio for %d players with reviews …",
              len(players_with_reviews))
 
-    def calc_unowned_ratio(pid):
-        pr = reviews[reviews["playerid"] == pid]
-        if len(pr) == 0:
-            return 0.0
-        lib = player_library.get(pid, set())
-        return (~pr["gameid"].isin(lib)).sum() / len(pr)
+    reviews_sub = reviews[reviews["playerid"].isin(players_with_reviews)].copy()
+    reviews_sub["gameid_int"] = reviews_sub["gameid"].apply(int)
 
-    unowned_ratio = pd.Series(
-        {pid: calc_unowned_ratio(pid) for pid in players_with_reviews},
-        name="unowned_ratio",
+    def _unowned(group):
+        pid = int(group.name)
+        if pid not in player_library:
+            return np.nan  # no library data → don't flag as review_bot
+        lib = player_library[pid]
+        return (~group["gameid_int"].isin(lib)).mean()
+
+    unowned_ratio = (
+        reviews_sub.groupby("playerid")
+        .apply(_unowned, include_groups=False)
+        .rename("unowned_ratio")
     )
 
-    heuristic_df = pd.concat(
-        [speed_stats, top1_conc, max_per_day, review_counts, ach_counts, unowned_ratio],
+    df = pd.concat(
+        [median_interval, min_interval, top1_conc, max_per_day,
+         night_ratio, ach_counts, review_counts, unowned_ratio],
         axis=1,
-    ).fillna(0)
+    ).fillna({"review_count": 0, "night_ratio": 0.0, "min_interval": 0.0})
+    # unowned_ratio NaN → review_bot condition (> 0.70) evaluates False → safe
 
-    heuristic_df["heuristic_bot"] = (
-        (heuristic_df["median_interval"] < 2)
-        | (heuristic_df["top1_concentration"] > 0.90)
-        | (heuristic_df["max_per_day"] > 500)
-        | ((heuristic_df["review_count"] > 0) & (heuristic_df["ach_count"] == 0))
-        | (heuristic_df["unowned_ratio"] > 0.80)
+    # ── Group 1: SPEED BOT — fast unlock AND concentrated in one game ─────────
+    # Real players need ≥ 30s between achievements even in easy games.
+    speed_bot = (
+        (df["median_interval"] < 10)        # median < 10 s
+        & (df["min_interval"]  < 1)         # at least one unlock < 1 s
+        & (df["top1_concentration"] > 0.85) # 85%+ achievements from a single game
+    )
+
+    # ── Group 2: VOLUME BOT — inhuman volume AND nocturnal activity ───────────
+    # 500 achievements/day = 1 every 3 minutes, 24/7 — impossible for humans.
+    volume_bot = (
+        (df["max_per_day"]  > 500)
+        & (df["night_ratio"] > 0.40)        # > 40% activity between 00:00–05:59
+        & (df["ach_count"]   > 1000)        # total ≥ 1 000 achievements
+    )
+
+    # ── Group 3: REVIEW BOT — reviews games they never played ─────────────────
+    review_bot = (
+        (df["review_count"]   > 5)          # enough sample to rule out coincidence
+        & (df["ach_count"]   == 0)          # zero achievements (never actually played)
+        & (df["unowned_ratio"] > 0.70)      # 70%+ reviews for games not in library
+    )
+
+    df["heuristic_bot"] = (speed_bot | volume_bot | review_bot).astype(int)
+
+    # ── Strict normal definition for PU Learning ──────────────────────────────
+    # These players are confidently NOT bots: they have meaningful achievement
+    # history (> 10) AND unlock achievements at a human pace (median > 30 min).
+    # Used to filter the XGBoost training set to "confident bot vs confident
+    # normal", dropping the ambiguous grey area that would add noise to labels.
+    heuristic_normal = (
+        (df["ach_count"] > 10)
+        & (df["median_interval"] > 1800)  # > 30 minutes between achievements
     ).astype(int)
+    df["heuristic_normal"] = heuristic_normal
 
-    n = heuristic_df["heuristic_bot"].sum()
-    log.info("  Heuristic bots: %d (%.2f%%)", n, heuristic_df["heuristic_bot"].mean() * 100)
-    return heuristic_df[["heuristic_bot"]]
+    log.info("  Speed bots:       %d", speed_bot.sum())
+    log.info("  Volume bots:      %d", volume_bot.sum())
+    log.info("  Review bots:      %d", review_bot.sum())
+    n_bot = df["heuristic_bot"].sum()
+    n_normal = df["heuristic_normal"].sum()
+    log.info("  Heuristic bots   (total unique): %d (%.2f%%)",
+             n_bot, df["heuristic_bot"].mean() * 100)
+    log.info("  Heuristic normal (total unique): %d (%.2f%%)",
+             n_normal, df["heuristic_normal"].mean() * 100)
+    return df[["heuristic_bot", "heuristic_normal"]]
 
 
 # ---------------------------------------------------------------------------
@@ -232,14 +291,22 @@ def _review_features(reviews: pd.DataFrame, player_library: dict) -> pd.DataFram
     """Group D: review behaviour signals."""
     total_reviews = reviews.groupby("playerid").size().rename("total_reviews")
 
-    # Fraction of reviews for unowned games
+    # Fraction of reviews for unowned games.
+    # Players absent from purchased_games have NO library data (private profile
+    # or not crawled) — return NaN so the downstream SimpleImputer fills them
+    # with the median of players who DO have library data.
+    # Using set() as default would force ratio = 1.0 for ~75% of players,
+    # artificially inflating the feature and dominating SHAP values.
     def unowned_ratio_fn(group):
-        lib = player_library.get(group.name, set())
-        return (~group["gameid"].isin(lib)).mean()
+        pid = int(group.name)
+        if pid not in player_library:
+            return np.nan
+        lib = player_library[pid]
+        return (~group["gameid"].apply(int).isin(lib)).mean()
 
     review_unowned = (
         reviews.groupby("playerid")
-        .apply(unowned_ratio_fn)
+        .apply(unowned_ratio_fn, include_groups=False)
         .rename("review_unowned_ratio")
     )
 
@@ -307,11 +374,18 @@ def build_feature_matrix(history: pd.DataFrame,
 
     log.info("  Group D: review features …")
     grp_d = _review_features(reviews, player_library)
-    # Players with no reviews default to 0 (not NaN) for review features
+    # Players with no reviews get 0 for count/rate features.
+    # review_unowned_ratio is intentionally left as NaN for:
+    #   (a) players with no reviews (unknown — not 0, since 0 would mean "all owned")
+    #   (b) players with reviews but absent from purchased_games (no library data)
+    # The SimpleImputer downstream will fill both cases with the median of
+    # players for whom we have valid library data.
     grp_d = grp_d.reindex(all_players).fillna(
-        {"total_reviews": 0, "review_unowned_ratio": 0.0,
-         "review_duplication_rate": 0.0, "avg_review_length": 0.0,
+        {"total_reviews": 0,
+         "review_duplication_rate": 0.0,
+         "avg_review_length": 0.0,
          "min_review_length": 0.0}
+        # review_unowned_ratio: leave NaN — handled by imputer
     )
 
     log.info("  Bonus: account age features …")

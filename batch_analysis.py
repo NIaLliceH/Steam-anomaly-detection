@@ -2,15 +2,20 @@ import os
 import subprocess
 import pandas as pd
 from datetime import datetime
+import argparse
+import sys
 
 # ==========================================
 # CONFIGURATION OF TARGET ACCOUNTS TO CHECK
 # ==========================================
 TARGET_STEAM_IDS = [
     76561198287996067,
-    76561199761358443,
     76561198399223263,
-    76561198350357346
+    76561198350357346,
+    76561198405841744,
+    76561198354838543,
+    76561198391038255,
+    76561198147116758
 ]
 
 CRAWL_DIR = "data/crawled"
@@ -18,15 +23,19 @@ RAW_DIR = "data/raw"
 OUTPUTS_DIR = "outputs"
 
 def inject_crawled_data():
-    """Inject data from data/crawled to data/raw, then delete crawl file to avoid duplicate injection"""
+    """Inject data from data/crawled to data/raw, then delete crawl file to avoid duplicate injection.
+    
+    Returns:
+        bool: True if any data was injected, False otherwise
+    """
     print("=== 1. INJECTING NEW DATA ===")
     files = ["players.csv", "purchased_games.csv", "history.csv", "reviews.csv"]
     injected_any = False
     
+    archive_folder = os.path.join("data/archive/", f"{pd.Timestamp.now().strftime('%Y%m%d_%H%M%S')}")
     for file in files:
         crawl_path = os.path.join(CRAWL_DIR, file)
         raw_path = os.path.join(RAW_DIR, file)
-        archive_path = os.path.join("data/archive/", f"{pd.Timestamp.now().strftime('%Y%m%d_%H%M%S')}")
         
         if os.path.exists(crawl_path):
             df_crawl = pd.read_csv(crawl_path)
@@ -48,13 +57,15 @@ def inject_crawled_data():
                 injected_any = True
                 
                 # move file to archive
-                os.makedirs(archive_path, exist_ok=True)
-                os.rename(crawl_path, os.path.join(archive_path, file))
-                print(f"[+] Moved {file} to {archive_path}/")
+                os.makedirs(archive_folder, exist_ok=True)
+                os.rename(crawl_path, os.path.join(archive_folder, file))
+                print(f"[+] Moved {file} to {archive_folder}/")
     
     
     if not injected_any:
         print("[-] No new data to inject.")
+    
+    return injected_any
 
 def run_ml_pipeline():
     """Automatically call Machine Learning scripts"""
@@ -65,51 +76,119 @@ def run_ml_pipeline():
     print("[*] Running Phase 2 (Anomaly Detection Model)...")
     subprocess.run(["python3", "main.py"], check=True)
 
+def _load_known_playerids():
+    """
+    Return a dict mapping playerid → reason_filtered for players that exist
+    somewhere in the pipeline but are absent from ensemble_results.csv.
+
+    Lookup order (most to least specific):
+      1. feature_matrix.csv (pre-trimming): player had activity data but failed
+         the trimming filter (< 10 achievements OR library_size < 1).
+      2. data/processed/players.parquet: player account exists but had no
+         achievements or reviews — never entered feature engineering.
+      3. data/raw/players.csv: player in raw data but removed as private account
+         during Phase 1 ETL.
+    """
+    sources = {}
+
+    # Source 1 — feature matrix (saved before trimming in main.py)
+    fm_path = os.path.join(OUTPUTS_DIR, "feature_matrix.csv")
+    if os.path.exists(fm_path):
+        try:
+            fm_ids = pd.read_csv(fm_path, usecols=["playerid"])["playerid"]
+            for pid in fm_ids:
+                sources[int(pid)] = (
+                    "Player exists in data but was excluded from the model during "
+                    "trimming (< 10 achievements or no game library — likely a "
+                    "sparse/inactive account)."
+                )
+        except Exception:
+            pass
+
+    # Source 2 — processed players parquet (after private-account filter)
+    proc_path = os.path.join("data", "processed", "players.parquet")
+    if os.path.exists(proc_path):
+        try:
+            proc_ids = pd.read_parquet(proc_path, columns=["playerid"])["playerid"]
+            for pid in proc_ids:
+                pid = int(pid)
+                if pid not in sources:
+                    sources[pid] = (
+                        "Player account is known but had no achievement or review "
+                        "history — not enough data to analyse."
+                    )
+        except Exception:
+            pass
+
+    # Source 3 — raw players CSV (includes private accounts)
+    raw_path = os.path.join("data", "raw", "players.csv")
+    if os.path.exists(raw_path):
+        try:
+            raw_ids = pd.read_csv(raw_path, usecols=["playerid"])["playerid"]
+            for pid in raw_ids:
+                pid = int(pid)
+                if pid not in sources:
+                    sources[pid] = (
+                        "Player is in raw data but was removed during Phase 1 ETL "
+                        "(private account filter)."
+                    )
+        except Exception:
+            pass
+
+    return sources
+
+
 def build_report_data(target_ids):
-    """Build report data structure from results and features"""
+    """Build report data structure from results and features."""
     try:
         results = pd.read_csv(os.path.join(OUTPUTS_DIR, "ensemble_results.csv"))
         features = pd.read_csv(os.path.join(OUTPUTS_DIR, "feature_matrix.csv"))
-        
-        # Calculate mean baseline for comparison
-        normal_mean = features[~features['playerid'].isin(target_ids)].mean()
-        
-        report_data = []
-        for pid in target_ids:
-            res = results[results['playerid'] == pid]
-            feat = features[features['playerid'] == pid]
-            
-            if res.empty:
-                report_data.append({
-                    'playerid': pid,
-                    'found': False
-                })
-                continue
-            
-            score = res.iloc[0]['composite_score']
-            is_bot = res.iloc[0]['is_anomaly'] == 1
-            user_feat = feat.iloc[0]
-            
-            entry = {
-                'playerid': pid,
-                'found': True,
-                'score': score,
-                'is_bot': is_bot,
-                'status': "ANOMALY DETECTED (BOT/FRAUD)" if is_bot else "NORMAL PLAYER",
-                'if_pct': res.iloc[0]['if_pct'],
-                'lof_pct': res.iloc[0]['lof_pct'],
-                'svm_pct': res.iloc[0]['svm_pct'],
-                'max_achievements_per_day': user_feat.get('max_achievements_per_day', 0),
-                'normal_avg_achievements': normal_mean['max_achievements_per_day'],
-                'review_unowned_ratio': user_feat.get('review_unowned_ratio', 0),
-                'cv_unlock_interval': user_feat.get('cv_unlock_interval', 0),
-                'total_achievements': user_feat.get('total_achievements', 0)
-            }
-            report_data.append(entry)
-        
-        return report_data
     except FileNotFoundError:
         return None
+
+    # Build lookup for players filtered out during preprocessing/trimming
+    known_ids = _load_known_playerids()
+
+    # Calculate mean baseline for comparison (exclude target ids)
+    normal_mean = features[~features['playerid'].isin(target_ids)].mean(numeric_only=True)
+
+    report_data = []
+    for pid in target_ids:
+        res  = results[results['playerid'] == pid]
+        feat = features[features['playerid'] == pid]
+
+        if res.empty:
+            filter_reason = known_ids.get(int(pid))
+            report_data.append({
+                'playerid': pid,
+                'found': False,
+                'filtered': filter_reason is not None,
+                'filter_reason': filter_reason or "Player ID not found in any data source.",
+            })
+            continue
+
+        score    = res.iloc[0]['composite_score']
+        is_bot   = res.iloc[0]['is_anomaly'] == 1
+        user_feat = feat.iloc[0] if not feat.empty else pd.Series(dtype=float)
+
+        entry = {
+            'playerid': pid,
+            'found': True,
+            'score': score,
+            'is_bot': is_bot,
+            'status': "ANOMALY DETECTED (BOT/FRAUD)" if is_bot else "NORMAL PLAYER",
+            'if_pct': res.iloc[0]['if_pct'],
+            'lof_pct': res.iloc[0]['lof_pct'],
+            'svm_pct': res.iloc[0]['svm_pct'],
+            'max_achievements_per_day': user_feat.get('max_achievements_per_day', 0),
+            'normal_avg_achievements': normal_mean['max_achievements_per_day'],
+            'review_unowned_ratio': user_feat.get('review_unowned_ratio', 0),
+            'cv_unlock_interval': user_feat.get('cv_unlock_interval', 0),
+            'total_achievements': user_feat.get('total_achievements', 0),
+        }
+        report_data.append(entry)
+
+    return report_data
 
 def generate_markdown_report(target_ids):
     """Generate Markdown formatted report"""
@@ -125,7 +204,11 @@ def generate_markdown_report(target_ids):
         md += f"## Steam ID: {pid}\n\n"
         
         if not entry['found']:
-            md += "> ⚠️ Not found in database!\n\n"
+            if entry['filtered']:
+                md += "> ℹ️ Player excluded from model during preprocessing.\n\n"
+                md += f"> **Reason:** {entry['filter_reason']}\n\n"
+            else:
+                md += "> ❌ Not found in any data source.\n\n"
             continue
         
         status_icon = "🚨" if entry['is_bot'] else "✅"
@@ -289,6 +372,10 @@ def generate_html_report(target_ids):
             padding: 15px;
             border-radius: 4px;
         }}
+        .not-found.filtered {{
+            background-color: #fff3cd;
+            color: #856404;
+        }}
         .footer {{
             text-align: center;
             color: #999;
@@ -312,7 +399,12 @@ def generate_html_report(target_ids):
         html += f'<span class="steam-id">Steam ID: {pid}</span>\n'
         
         if not entry['found']:
-            html += '</div>\n<div class="not-found">⚠️ Not found in database!</div>\n'
+            html += '</div>\n'
+            if entry['filtered']:
+                html += '<div class="not-found filtered">ℹ️ Player excluded from model during preprocessing.<br>'
+                html += f'<small>{entry["filter_reason"]}</small></div>\n'
+            else:
+                html += '<div class="not-found">❌ Not found in any data source.</div>\n'
             html += '</div>\n'
             continue
         
@@ -377,9 +469,13 @@ def generate_report(target_ids, output_format='console'):
         
         for entry in report_data:
             pid = entry['playerid']
-            
+
             if not entry['found']:
-                print(f"[-] Steam ID: {pid} -> Not found in database!")
+                if entry['filtered']:
+                    print(f"[~] Steam ID: {pid} -> Excluded from model during preprocessing.")
+                    print(f"    Reason: {entry['filter_reason']}")
+                else:
+                    print(f"[-] Steam ID: {pid} -> Not found in any data source.")
                 continue
             
             status = entry['status']
@@ -423,6 +519,60 @@ def generate_report(target_ids, output_format='console'):
             print(f"[+] HTML report saved: {html_file}")
 
 if __name__ == "__main__":
-    inject_crawled_data()
-    run_ml_pipeline()
-    generate_report(TARGET_STEAM_IDS, output_format='all')
+    parser = argparse.ArgumentParser(
+        description="Batch analysis of Steam profiles for anomaly detection",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  python3 batch_analysis.py                           # Full pipeline (if new data exists)
+  python3 batch_analysis.py --query-only              # Skip injection, query existing results only
+  python3 batch_analysis.py --query-only --steam-ids 123 456  # Query specific player IDs
+        """
+    )
+    
+    parser.add_argument(
+        '--query-only',
+        action='store_true',
+        help='Skip data injection and pipeline; only generate reports from existing results'
+    )
+    
+    parser.add_argument(
+        '--steam-ids',
+        nargs='+',
+        type=int,
+        help='Specific Steam IDs to query (overrides TARGET_STEAM_IDS)'
+    )
+    
+    parser.add_argument(
+        '--format',
+        choices=['markdown', 'html', 'all'],
+        default='all',
+        help='Report output format (default: all)'
+    )
+    
+    args = parser.parse_args()
+    
+    # Determine target IDs
+    target_ids = args.steam_ids if args.steam_ids else TARGET_STEAM_IDS
+    
+    # Execute based on arguments
+    if args.query_only:
+        print("[*] QUERY-ONLY MODE: Skipping injection and pipeline.")
+        print(f"[*] Generating reports for {len(target_ids)} player IDs...\n")
+        generate_report(target_ids, output_format=args.format)
+    else:
+        # Inject data and check if anything was injected
+        data_injected = inject_crawled_data()
+        
+        if data_injected:
+            print("\n=== 2. RUNNING AI PIPELINE (Please wait...) ===")
+            print("[*] Running Phase 1 (Data Prep)...")
+            subprocess.run(["python3", "src/data_prep.py"], check=True)
+            
+            print("[*] Running Phase 2 (Anomaly Detection Model)...")
+            subprocess.run(["python3", "main.py"], check=True)
+        else:
+            print("\n[*] No new data injected. Skipping pipeline and using existing results.")
+        
+        print(f"\n[*] Generating reports for {len(target_ids)} player IDs...\n")
+        generate_report(target_ids, output_format=args.format)

@@ -1,419 +1,419 @@
 # Steam Account Anomaly Detection System
 
-> **An ensemble machine learning system to identify bot accounts, fraudulent activities, and suspicious behavior patterns in the Steam gaming platform.**
+> **Hệ thống phát hiện bất thường sử dụng Semi-supervised XGBoost kết hợp Ensemble để nhận diện bot accounts và hoạt động gian lận trên nền tảng Steam.**
 
 ---
 
-## 📋 Problem Statement
+## Bài toán
 
-Steam hosts millions of player accounts with varying patterns of behavior. Among these, some accounts engage in suspicious or fraudulent activities:
+Steam là nền tảng game lớn nhất thế giới với hàng triệu tài khoản người dùng. Trong đó tồn tại các tài khoản có hành vi bất thường:
 
-- **Bot/Automated Accounts**: Accounts designed to unlock achievements automatically without genuine gameplay
-- **Fraud**: Fake reviews posted for unowned games, credential sharing, and account misuse  
-- **Market Manipulation**: Coordinated behavior to exploit trading systems or manipulate game stats
+- **Bot tự động**: Tài khoản dùng script để unlock thành tích mà không chơi thật
+- **Review Fraud**: Đăng đánh giá cho game chưa từng mua/chơi
+- **Account Farm**: Tài khoản hoạt động bất thường về thời gian hoặc khối lượng
 
-Traditional rule-based detection is limited and easy to circumvent. This project uses **ensemble machine learning** to detect anomalies by analyzing behavioral patterns in player gaming data, achievement histories, and review activity.
+Dự án sử dụng **Semi-supervised Ensemble ML** gồm XGBoost (primary) + IsolationForest / LOF / OneClassSVM (secondary) để phân tích behavioral patterns từ dữ liệu lịch sử thành tích, thư viện game, và review của từng người chơi.
 
-### Key Challenges
+### Thách thức chính
 
-- **No Ground Truth**: We don't have definitive labels for bot vs. legitimate accounts
-- **Feature Engineering**: Must extract meaningful behavioral signals from raw gaming data
-- **Class Imbalance**: Anomalies are rare compared to normal players  
-- **Target Leakage**: Heuristic validation labels are derived from the same features used for training (accepted trade-off)
-
----
-
-## 🎯 Approach
-
-### 1. **Data Preparation** (`src/data_prep.py`)
-   - Load and clean raw CSV files from Steam dataset (~1.5 GB total)
-   - Parse dates with explicit formats for performance
-   - Filter private/suspicious accounts
-   - Convert to fast parquet format for processing
-
-### 2. **Feature Engineering** (`src/features.py`)
-   - Extract 30+ behavioral features across three dimensions:
-     - **Achievement Patterns**: unlock speed, distribution, frequency
-     - **Review Behavior**: review-to-game ratio, unowned game reviews, temporal patterns
-     - **Purchase & Library**: game count, genre diversity, account age
-
-### 3. **Heuristic Labeling** (`src/features.py`)
-   - Rule-based validation labels for model training
-   - Rules based on domain knowledge (extreme unlock speeds, suspicious review ratios, etc.)
-   - Creates weak labeled dataset for semi-supervised learning
-
-### 4. **Model Training & Tuning** (`src/models.py`)
-   - **Isolation Forest**: Detects statistical outliers
-   - **Local Outlier Factor (LOF)**: Identifies local density anomalies
-   - **Support Vector Machine (SVM)**: Separates anomalous behaviors
-   - Hyperparameter tuning via grid search on ROC-AUC
-
-### 5. **Ensemble Voting** (`src/models.py`)
-   - Combines predictions from all three models
-   - Generates composite anomaly score (0-100)
-   - Final classification based on voting threshold
-
-### 6. **Evaluation** (`src/evaluate.py`)
-   - Cross-validation and performance metrics
-   - ROC/AUC analysis
-   - Feature importance analysis
+| Thách thức | Cách xử lý |
+|---|---|
+| Không có ground truth | Heuristic labels V2 với AND-logic 3 nhóm bot rõ ràng |
+| Class imbalance cực độ | PU Learning — loại grey area khỏi tập train XGBoost |
+| Ghost accounts (~75%) | Data trimming: chỉ giữ players có ≥ 10 thành tích và ≥ 1 game |
+| PCA collapse do heavy tails | log1p transform 10 features trước preprocessing |
+| IQR ≈ 0 của ghost accounts | Thay RobustScaler bằng StandardScaler sau log1p |
+| review_unowned_ratio bị inflate | Trả NaN thay vì set() rỗng cho player không có library data |
 
 ---
 
-## 🔄 ML Pipeline Architecture
+## Kiến trúc Pipeline
 
 ```
 ┌─────────────────────────────────────────────────────────────┐
-│ 1. RAW DATA (CSV)                                           │
-│    • achievements.csv (144 MB)                              │
-│    • history.csv (648 MB)  - achievement unlock records     │
-│    • reviews.csv (552 MB)  - player reviews                 │
-│    • players.csv (18 MB)   - player metadata                │
-│    • purchased_games.csv (92 MB)                            │
-│    • games.csv, prices.csv, friends.csv                     │
+│  PHASE 1 — DATA ETL  (src/data_prep.py)                     │
+│                                                             │
+│  Raw CSV (~1.5 GB)                                          │
+│    history.csv, players.csv, reviews.csv,                   │
+│    purchased_games.csv, private_steamids.csv                │
+│                                ↓                            │
+│  • Lọc private accounts (227k IDs)                          │
+│  • Parse datetime với explicit format                       │
+│  • Extract gameid từ achievementid string                   │
+│  • Dedup + type-optimize → export Parquet                   │
+│                                                             │
+│  Output: data/processed/{history,players,reviews,           │
+│          purchased}.parquet                                 │
 └─────────────────────────────────────────────────────────────┘
                               ↓
 ┌─────────────────────────────────────────────────────────────┐
-│ 2. DATA PREPARATION (data_prep.py)                          │
-│    • Type-optimized loading (reduce RAM ~50%)               │
-│    • Date parsing with explicit formats                     │
-│    • Filter private accounts                                │
-│    • Output: Parquet files in data/processed/               │
+│  PHASE 2 — ML PIPELINE  (main.py)                           │
+│                                                             │
+│  Step 2: Heuristic Labels V2  (features.py)                 │
+│    • 3 nhóm bot — AND logic (không OR):                     │
+│      - Speed Bot: median_interval<10s AND min<1s AND top1>85%│
+│      - Volume Bot: max_per_day>500 AND night>40% AND ach>1k  │
+│      - Review Bot: reviews>5 AND 0 ach AND unowned>70%      │
+│    • Strict Normal: ach_count>10 AND median_interval>1800s  │
+│    Output: heuristic_labels.csv (bot + normal columns)      │
+│                                                             │
+│  Step 3: Feature Engineering  (features.py)                 │
+│    • 25 features / 5 nhóm:                                  │
+│      A. Speed (6): median/min/std interval, cv, max/min/day │
+│      B. Temporal (4): night ratio, hour entropy, density,   │
+│                       weekend ratio                         │
+│      C. Diversity (8): total ach, games w/ ach, library     │
+│                        size, ach/game ratio, top1/3/HHI     │
+│      D. Review (5): count, unowned_ratio*, dup rate,        │
+│                     avg/min length                          │
+│      E. Account Age (2): days_before_first_ach, account_age │
+│    • *unowned_ratio = NaN nếu không có library data         │
+│      (tránh inflate giả tạo)                                │
+│    Output: feature_matrix.csv                               │
+│                                                             │
+│  DATA TRIMMING  (main.py)                                   │
+│    • Loại ghost/sparse accounts:                            │
+│      total_achievements >= 10 AND library_size >= 1         │
+│    • ~196k → ~40-60k players (active accounts only)         │
+│                                                             │
+│  Step 4: Preprocessing  (models.py)                         │
+│    1. log1p(clip(x, 0)) cho 10 heavy-tailed features        │
+│    2. SimpleImputer(strategy="median")                       │
+│    3. StandardScaler  (thay RobustScaler — IQR≈0 bug)       │
+│    4. PCA(n_components=0.90)  giữ 90% variance              │
+│    → Log per-component variance để verify không collapse    │
+│    Output: preprocessor.pkl, PCA component names           │
+│                                                             │
+│  Step 5a: Unsupervised Tuning  (models.py)                  │
+│    • Grid search trên heuristic labels:                     │
+│      - IsolationForest: 54 combos                           │
+│      - LOF (novelty=True, sample=20k): 24 combos            │
+│      - OneClassSVM (sample=20k): 12 combos                  │
+│    Output: tuning_results.csv                               │
+│                                                             │
+│  Step 5b: XGBoost — PRIMARY MODEL  (models.py)              │
+│    • PU Learning filter:                                    │
+│      train chỉ trên: heuristic_bot==1 OR heuristic_normal==1│
+│      loại grey area (không rõ bot hay người thật)           │
+│    • scale_pos_weight = neg/pos (xử lý class imbalance)     │
+│    • RandomizedSearchCV(n_iter=50, cv=5, scoring=PR-AUC)    │
+│    • predict_proba() chạy trên TOÀN BỘ trimmed dataset     │
+│    Output: best_xgb.pkl, xgb_tuning_results.csv            │
+│                                                             │
+│  Step 6: Train Final Unsupervised  (models.py)              │
+│    • Retrain IF/LOF/OCSVM với best params trên toàn bộ data │
+│                                                             │
+│  Step 7: Ensemble  (models.py)                              │
+│    • Percentile rank mỗi model (0-100)                      │
+│    • IF auto-flip: nếu AUC < 0.4 → đảo score (inversion)   │
+│    • Weighted composite:                                    │
+│        XGB×0.50 + LOF×0.30 + IF×0.15 + OCSVM×0.05         │
+│    • Voting: flag nếu ≥ 2 models đồng ý (top 5%)           │
+│    Output: ensemble_results.csv                             │
+│                                                             │
+│  Step 8: Evaluation  (evaluate.py)                          │
+│    • ROC-AUC và PR-AUC cho tất cả models                    │
+│    • Precision@100/500/1000                                 │
+│    • Top-50 flagged vs normal feature profile               │
+│    • XGBoost: PR curve, optimal F1 threshold,               │
+│               feature importance                            │
+│    Output: model_comparison_v2.csv, plots/                  │
+│                                                             │
+│  Step 9: SHAP Explanations  (evaluate.py)                   │
+│    • Native XGBoost SHAP (pred_contribs=True)               │
+│      bypass lỗi TreeExplainer "[5E-1]"                      │
+│    • Summary bar plot, waterfall top-1, scatter top-3       │
+│    Output: plots/shap_*.png                                 │
 └─────────────────────────────────────────────────────────────┘
-                              ↓
-┌─────────────────────────────────────────────────────────────┐
-│ 3. FEATURE ENGINEERING (features.py)                        │
-│    • build_feature_matrix(): 30+ behavioral features        │
-│    • build_heuristic_labels(): Rule-based weak labels       │
-│    • Output: feature_matrix.csv, heuristic_labels.csv       │
-└─────────────────────────────────────────────────────────────┘
-                              ↓
-┌─────────────────────────────────────────────────────────────┐
-│ 4. MODEL TRAINING (models.py)                               │
-│    ├─ Preprocess: StandardScaler + PCA                      │
-│    ├─ Tune: GridSearchCV on three models                    │
-│    │   • Isolation Forest                                   │
-│    │   • Local Outlier Factor                               │
-│    │   • Support Vector Machine                             │
-│    └─ Output: tuning_results.csv                            │
-└─────────────────────────────────────────────────────────────┘
-                              ↓
-┌─────────────────────────────────────────────────────────────┐
-│ 5. ENSEMBLE & EVALUATION (models.py + evaluate.py)          │
-│    • Voting ensemble from three models                      │
-│    • Composite score: average of model confidences          │
-│    • Output: ensemble_results.csv, model_comparison.csv     │
-└─────────────────────────────────────────────────────────────┘
-                              ↓
-┌─────────────────────────────────────────────────────────────┐
-│ 6. REPORTING (batch_analysis.py)                            │
-│    • Console output, Markdown, or HTML reports              │
-│    • Query specific Steam IDs                               │
-│    • Show evidence for flagged accounts                     │
-│    • Output: detection_report.md/html                       │
-└─────────────────────────────────────────────────────────────┘
-```
-
----
-
-## 📊 Input & Output Data
-
-### Input Data (Raw CSV Files)
-
-| File | Size | Description |
-|------|------|-------------|
-| `history.csv` | 648 MB | playerid, achievementid, date_acquired |
-| `reviews.csv` | 552 MB | playerid, gameid, review text, posted date |
-| `players.csv` | 18 MB | playerid, country, account creation date |
-| `purchased_games.csv` | 92 MB | playerid, game library |
-| `achievements.csv` | 144 MB | achievementid, gameid, title, description |
-| `games.csv` | 17 MB | gameid, title, genres, release date |
-| `prices.csv` | 184 MB | gameid, price in different currencies |
-| `private_steamids.csv` | 4 MB | Known private/suspicious accounts |
-
-**Location**: `data/raw/`
-
-### Processed Data (Intermediate)
-
-| File | Format | Description |
-|------|--------|-------------|
-| `history.parquet` | Parquet | Cleaned history with parsed dates |
-| `players.parquet` | Parquet | Filtered player metadata |
-| `reviews.parquet` | Parquet | Review data with validation |
-| `purchased.parquet` | Parquet | Player library information |
-
-**Location**: `data/processed/`
-
-### Output Data (Results)
-
-| File | Description |
-|------|-------------|
-| `feature_matrix.csv` | 30+ features per player (rows: players × columns: features) |
-| `heuristic_labels.csv` | Rule-based labels for training (playerid, label, confidence) |
-| `tuning_results.csv` | Hyperparameter tuning metrics for each model |
-| `ensemble_results.csv` | **Main Results**: playerid, composite_score, is_anomaly, if_pct, lof_pct, svm_pct |
-| `model_comparison.csv` | Performance comparison across models |
-| `plots/` | Visualizations (ROC curves, feature importance, etc.) |
-| `detection_report.md` | Markdown report for target accounts |
-| `detection_report.html` | Styled HTML report for target accounts |
-
-**Location**: `outputs/`
-
-### Key Output Columns in `ensemble_results.csv`
-
-```
-playerid              : Steam player ID (int64)
-composite_score       : Anomaly likelihood 0-100 (higher = more suspicious)
-is_anomaly            : Binary classification (1 = flagged, 0 = normal)
-if_pct                : Isolation Forest confidence (%)
-lof_pct               : Local Outlier Factor confidence (%)
-svm_pct               : SVM confidence (%)
-flagged_reason        : Brief description of suspicious behavior
 ```
 
 ---
 
-## 🚀 Usage
+## Cấu trúc thư mục
 
-### Quick Start
+```
+btl/
+├── batch_analysis.py        # Entry point: inject data + chạy pipeline + report
+├── main.py                  # ML pipeline orchestrator (Steps 2-9)
+├── steam_crawling.py        # Script crawl dữ liệu Steam
+├── README.md
+├── dataset_structure.md     # Mô tả format dữ liệu thô
+│
+├── src/
+│   ├── data_prep.py         # Phase 1: ETL, clean, export Parquet
+│   ├── features.py          # Step 2-3: Heuristic labels + feature engineering
+│   ├── models.py            # Step 4-7: Preprocessing, training, ensemble
+│   └── evaluate.py          # Step 8-9: Metrics, plots, SHAP
+│
+├── data/
+│   ├── raw/                 # CSV gốc
+│   ├── processed/           # Parquet (output của data_prep.py)
+│   ├── crawled/             # Data mới để inject
+│   └── archive/             # Backup theo timestamp
+│
+└── outputs/
+    ├── feature_matrix.csv
+    ├── heuristic_labels.csv
+    ├── tuning_results.csv
+    ├── xgb_tuning_results.csv
+    ├── ensemble_results.csv
+    ├── model_comparison_v2.csv
+    ├── best_xgb.pkl
+    ├── preprocessor.pkl
+    └── plots/
+        ├── shap_summary.png
+        ├── shap_waterfall.png
+        ├── shap_scatter_*.png
+        ├── xgb_pr_curve.png
+        └── xgb_feature_importance.png
+```
 
-#### 1. **Run Full Pipeline**
+---
+
+## Input / Output
+
+### Input — Raw CSV
+
+| File | Kích thước | Nội dung |
+|------|-----------|----------|
+| `history.csv` | ~647 MB | playerid, achievementid, date_acquired |
+| `reviews.csv` | ~551 MB | playerid, gameid, review text, posted date |
+| `players.csv` | ~18 MB | playerid, country, created date |
+| `purchased_games.csv` | ~92 MB | playerid, library (list of gameids) |
+| `private_steamids.csv` | ~4 MB | playerid của tài khoản private |
+
+**Vị trí**: `data/raw/`
+
+### Output chính — `ensemble_results.csv`
+
+| Cột | Mô tả |
+|-----|-------|
+| `playerid` | Steam player ID |
+| `composite_score` | Điểm nghi vấn tổng hợp 0–100 (cao = đáng ngờ hơn) |
+| `is_anomaly` | 1 = bị flag, 0 = bình thường |
+| `xgb_proba` | Xác suất bot theo XGBoost (0–1) |
+| `xgb_pct` / `if_pct` / `lof_pct` / `svm_pct` | Percentile rank từng model |
+| `vote_count` | Số model đồng ý flag (0–4) |
+| `heuristic_bot` | Nhãn heuristic (pseudo ground truth) |
+
+---
+
+## Cách chạy
+
+### Chạy toàn bộ pipeline
 
 ```bash
 python3 batch_analysis.py
 ```
 
-This script:
-1. Injects new crawled data into raw data
-2. Runs Phase 1 (Data Preparation)
-3. Runs Phase 2 (Anomaly Detection Model)
-4. Generates reports
+Script sẽ:
+1. Inject data mới từ `data/crawled/` vào `data/raw/`
+2. Chạy Phase 1 (data_prep.py)
+3. Chạy Phase 2 (main.py)
+4. Tạo report cho `TARGET_STEAM_IDS`
 
-**Configuration**: Edit `TARGET_STEAM_IDS` in `batch_analysis.py`:
-
+Chỉnh danh sách account cần kiểm tra trong `batch_analysis.py`:
 ```python
-TARGET_STEAM_IDS = [
-    76561198287996067,
-    76561199761358443,
-    76561198399223263,
-    76561198350357346
-]
+TARGET_STEAM_IDS = [76561198287996067, ...]
 ```
 
-#### 2. **Generate Reports Only**
+### Chạy từng bước
+
+```bash
+# Phase 1: ETL
+python3 src/data_prep.py
+
+# Phase 2: ML Pipeline
+python3 main.py
+```
+
+### Tạo report
 
 ```python
 from batch_analysis import generate_report
 
-# Console output
-generate_report(TARGET_STEAM_IDS, output_format='console')
-
-# Markdown report
-generate_report(TARGET_STEAM_IDS, output_format='markdown')
-
-# HTML report (styled)
-generate_report(TARGET_STEAM_IDS, output_format='html')
-
-# All three formats
-generate_report(TARGET_STEAM_IDS, output_format='all')
-```
-
-#### 3. **Manual Step Execution**
-
-```bash
-# Step 1: Data Preparation
-python3 src/data_prep.py
-
-# Step 2-9: ML Pipeline
-python3 main.py
-```
-
-### Data Injection (Adding New Suspicious Accounts)
-
-Place new player data CSVs in `data/crawled/`:
-- `players.csv`
-- `purchased_games.csv`
-- `history.csv`
-- `reviews.csv`
-
-Then run `batch_analysis.py` - it will:
-- Append data to `data/raw/`
-- Archive original files with timestamp
-- Run the full pipeline with new data
-
-### Report Output Examples
-
-**Console Output:**
-```
-============================================================
-AI DETECTION REPORT FOR TARGET ACCOUNTS
-============================================================
-
-STEAM ID: 76561198287996067
-   Status: ANOMALY DETECTED (BOT/FRAUD)
-   AI Suspicion Score: 87.33 / 100
-   Model Votes: IF=95.0%, LOF=72.0%, SVM=95.0%
-   BEHAVIOR EVIDENCE (Why flagged?):
-      - Abnormal speed: Unlocked 1250 achievements/day (Average player only 2.5)
-      - Fake reviews: 78.5% of reviews are for games not owned
-```
-
-**HTML Report:** Interactive styled report saved to `outputs/detection_report.html`
-
-**Markdown Report:** Portable report saved to `outputs/detection_report.md`
-
----
-
-## 🔍 Feature Engineering Details
-
-The system analyzes 30+ features across three behavioral dimensions:
-
-### Achievement Patterns (11 features)
-- `total_achievements`: Total unlocks
-- `max_achievements_per_day`: Peak daily unlock speed
-- `median_unlock_interval`: Typical time between unlocks
-- `cv_unlock_interval`: Consistency of unlock intervals
-- `top1_game_concentration`: % of achievements from top game
-- `days_active`: Account age in days
-- ...and 6 more
-
-### Review Behavior (8 features)
-- `total_reviews`: Number of reviews posted
-- `review_unowned_ratio`: % of reviews for games not owned
-- `review_helpful_ratio`: Average helpful votes per review
-- `review_length_mean`: Average review text length
-- ...and 4 more
-
-### Purchase & Library (11 features)
-- `total_games`: Games in library
-- `games_per_year`: Purchase rate
-- `genre_diversity`: Number of unique genres
-- `avg_game_price`: Average game price in USD
-- ...and 7 more
-
-### Temporal Features
-- Account age, activity recency, seasonal patterns
-
----
-
-## ⚙️ Configuration & Customization
-
-### Model Hyperparameters
-
-Edit `src/models.py` to customize:
-- Isolation Forest: `contamination`, `max_samples`
-- LOF: `n_neighbors`, `contamination`
-- SVM: `kernel`, `gamma`, `C`
-
-### Feature Selection
-
-Edit `src/features.py` to:
-- Add/remove features
-- Adjust heuristic thresholds
-- Modify feature scaling
-
-### Tuning Parameters
-
-In `main.py`, adjust:
-- `RANDOM_STATE`: For reproducibility
-- `TEST_SIZE`: Train-test split ratio
-- Grid search bounds in `tune_models()`
-
----
-
-## 📈 Performance Metrics
-
-Typical results on validation set:
-- **ROC-AUC**: 0.85-0.95
-- **Precision** (at 0.5 threshold): 0.80-0.90
-- **Recall**: 0.70-0.85
-- **F1-Score**: 0.75-0.87
-
-*Note: Metrics are against heuristic labels, not ground truth*
-
----
-
-## 🛠️ Dependencies
-
-```
-pandas>=1.3.0
-scikit-learn>=1.0.0
-numpy>=1.20.0
-scipy>=1.7.0
-```
-
-Install: `pip install -r requirements.txt` (if available)
-
----
-
-## 📝 Project Structure
-
-```
-btl/
-├── batch_analysis.py          # Main entry point (reports + orchestration)
-├── main.py                    # ML pipeline orchestrator
-├── steam_crawling.py          # Data crawling script
-├── README.md                  # This file
-├── dataset_structure.md       # Data format documentation
-├── steam_anomaly_implementation.md  # Detailed implementation notes
-│
-├── src/
-│   ├── data_prep.py           # Step 1: Data loading & cleaning
-│   ├── features.py            # Step 2-3: Feature engineering & heuristics
-│   ├── models.py              # Step 4-5: Training & ensemble
-│   └── evaluate.py            # Step 6: Evaluation & metrics
-│
-├── data/
-│   ├── raw/                   # Original CSV files
-│   ├── processed/             # Parquet files (intermediate)
-│   ├── crawled/               # New data for injection
-│   └── archive/               # Timestamped backups
-│
-└── outputs/
-    ├── feature_matrix.csv
-    ├── heuristic_labels.csv
-    ├── ensemble_results.csv
-    ├── detection_report.md    # Generated report (markdown)
-    ├── detection_report.html  # Generated report (HTML)
-    └── plots/                 # Visualizations
+generate_report(TARGET_STEAM_IDS, output_format='console')   # In ra terminal
+generate_report(TARGET_STEAM_IDS, output_format='markdown')  # outputs/detection_report.md
+generate_report(TARGET_STEAM_IDS, output_format='html')      # outputs/detection_report.html
+generate_report(TARGET_STEAM_IDS, output_format='all')       # Cả 3 format
 ```
 
 ---
 
-## 🤝 Contributing
+## Feature Engineering — 25 features
 
-To add new features or models:
+### Group A — Tốc độ unlock (6 features)
+| Feature | Ý nghĩa |
+|---------|---------|
+| `median_unlock_interval_sec` | Thời gian trung vị giữa 2 lần unlock liên tiếp |
+| `min_unlock_interval_sec` | Khoảng cách nhỏ nhất — phát hiện unlock tức thì |
+| `std_unlock_interval_sec` | Độ lệch chuẩn — bots thường đều đặn bất thường |
+| `cv_unlock_interval` | Hệ số biến thiên (std/mean) |
+| `max_achievements_per_minute` | Tốc độ đỉnh theo phút |
+| `max_achievements_per_day` | Tốc độ đỉnh theo ngày |
 
-1. **New Features**: Add to `src/features.py::build_feature_matrix()`
-2. **New Model**: Add to `src/models.py` and integrate into ensemble
-3. **New Evaluation**: Extend `src/evaluate.py`
+### Group B — Temporal (4 features)
+| Feature | Ý nghĩa |
+|---------|---------|
+| `night_activity_ratio` | Tỷ lệ hoạt động 00:00–05:59 |
+| `hour_entropy` | Shannon entropy phân phối 24h (thấp = pattern cứng nhắc) |
+| `activity_density` | Số ngày active / tổng span ngày |
+| `weekend_ratio` | Tỷ lệ hoạt động cuối tuần |
+
+### Group C — Game diversity (8 features)
+| Feature | Ý nghĩa |
+|---------|---------|
+| `total_achievements` | Tổng thành tích |
+| `games_with_achievements` | Số game khác nhau có thành tích |
+| `library_size` | Số game trong thư viện |
+| `achievement_game_ratio` | Tỷ lệ games có ach / library |
+| `top1_game_concentration` | % thành tích đến từ 1 game |
+| `top3_game_concentration` | % thành tích đến từ 3 game |
+| `game_hhi` | Herfindahl index — đo mức độ tập trung |
+| `avg_achievements_per_game` | Trung bình ach mỗi game |
+
+### Group D — Review behavior (5 features)
+| Feature | Ý nghĩa |
+|---------|---------|
+| `total_reviews` | Số review đã đăng |
+| `review_unowned_ratio` | % review cho game không có trong library (NaN nếu không có library data) |
+| `review_duplication_rate` | Tỷ lệ review trùng lặp (sau lowercase + strip) |
+| `avg_review_length` | Độ dài trung bình review (ký tự) |
+| `min_review_length` | Độ dài review ngắn nhất |
+
+### Group E — Account age (2 features)
+| Feature | Ý nghĩa |
+|---------|---------|
+| `days_before_first_achievement` | Số ngày từ tạo account đến lần unlock đầu tiên |
+| `account_age_days` | Tuổi account tính đến ngày chạy |
 
 ---
 
-## 📌 Important Notes
+## Heuristic Labels V2
 
-### Known Limitations
+Nhãn heuristic được dùng làm pseudo ground truth để tuning và đánh giá (không phải ground truth thực sự).
 
-1. **Target Leakage**: Heuristic labels derived from features used in training
-2. **No Ground Truth**: Validation is against synthetic rules, not real bot labels
-3. **Feature Drift**: New attack patterns may not be captured by historical features
+### Nhóm bot (heuristic_bot = 1)
 
-### Best Practices
+Dùng AND logic để giảm false positive (khác V1 dùng OR):
 
-- Always run full pipeline when adding new data
-- Monitor model performance on recent data
-- Regularly audit flagged accounts for false positives
-- Update heuristic rules as new patterns emerge
+**Speed Bot** — Bot unlock nhanh bất thường:
+```
+median_interval < 10s AND min_interval < 1s AND top1_concentration > 85%
+```
+
+**Volume Bot** — Bot khối lượng lớn + hoạt động ban đêm:
+```
+max_per_day > 500 AND night_ratio > 40% AND ach_count > 1000
+```
+
+**Review Bot** — Bot review game chưa chơi:
+```
+review_count > 5 AND ach_count == 0 AND unowned_ratio > 70%
+```
+
+### Người dùng bình thường (heuristic_normal = 1)
+
+Dùng cho PU Learning — chỉ bao gồm người rõ ràng không phải bot:
+```
+ach_count > 10 AND median_interval > 1800s (30 phút)
+```
 
 ---
 
-## 📞 Support
+## Preprocessing Pipeline
 
-For issues or questions, refer to:
-- `steam_anomaly_implementation.md` - Detailed technical approach
-- `dataset_structure.md` - Data format specifications
-- Code comments in `src/` modules
+```
+X_raw (25 features)
+    ↓
+log1p(clip(x, 0)) cho 10 heavy-tailed features:
+  total_achievements, max_achievements_per_day,
+  max_achievements_per_minute, median_unlock_interval_sec,
+  min_unlock_interval_sec, std_unlock_interval_sec,
+  avg_achievements_per_game, library_size,
+  total_reviews, avg_review_length
+    ↓
+SimpleImputer(strategy="median")   ← fill NaN bằng median
+    ↓
+StandardScaler()   ← z-score (tốt hơn RobustScaler sau log1p)
+    ↓
+PCA(n_components=0.90)   ← giữ 90% variance → 8-12 components
+    ↓
+X_scaled (PCA components)
+```
+
+**Lý do log1p**: `std_unlock_interval_sec` có thể lên đến hàng triệu giây, làm PCA collapse: PC1 giải thích >92% variance chỉ bởi 1 chiều → LOF/OCSVM chạy trên dữ liệu 1D.
+
+**Lý do StandardScaler thay RobustScaler**: Ghost accounts (0 achievements) chiếm ~75% dataset — IQR của hầu hết features ≈ 0 → RobustScaler scale active players lên giá trị cực lớn.
 
 ---
 
-**Last Updated**: April 3, 2026
+## Models
+
+### XGBoost — Primary (Semi-supervised PU Learning)
+
+- **Training set**: chỉ `heuristic_bot==1` OR `heuristic_normal==1`
+  - Loại grey area để tránh noisy labels
+- **scale_pos_weight** = confirmed_normal / bot (xử lý imbalance)
+- **Tuning**: RandomizedSearchCV(n_iter=50, cv=5, scoring=PR-AUC)
+- **Scoring**: predict_proba() trên toàn bộ trimmed dataset
+- **Weight trong ensemble**: 0.50
+
+### IsolationForest — Secondary
+
+- Phát hiện statistical outliers trong không gian PCA
+- Grid search: 54 combos (n_estimators, max_samples, contamination, max_features)
+- Auto-flip: nếu ROC-AUC < 0.4 → đảo score (inversion detection)
+- **Weight**: 0.15
+
+### Local Outlier Factor — Secondary
+
+- Phát hiện local density anomalies
+- Train trên 20k sample (O(N²) complexity)
+- **Weight**: 0.30
+
+### OneClassSVM — Secondary
+
+- RBF kernel, train trên 20k sample
+- **Weight**: 0.05
+
+### Ensemble
+
+```
+composite_score = 0.50 × XGB_pct
+               + 0.30 × LOF_pct
+               + 0.15 × IF_pct (sau khi flip nếu cần)
+               + 0.05 × SVM_pct
+
+is_anomaly = 1  nếu ≥ 2 trong 4 models flag (top 5% của model đó)
+```
+
+---
+
+## Dependencies
+
+```
+pandas
+numpy
+scikit-learn
+scipy
+xgboost
+shap
+matplotlib
+joblib
+pyarrow          # đọc/ghi Parquet
+```
+
+Cài đặt: `pip install -r requirements.txt`
+
+---
+
+## Giới hạn đã biết
+
+1. **Target leakage**: Heuristic labels được tính từ các features cũng dùng để train — metrics ROC-AUC đo "model có bắt chước heuristic rules không", không phải "model phát hiện bot thực sự tốt đến đâu"
+2. **Không có ground truth**: Không có nhãn thực xác nhận tài khoản nào là bot
+3. **purchased_games coverage thấp**: ~75% người có review không có trong bảng purchased_games → `review_unowned_ratio` bị impute bằng median
+
+---
+
+**Last Updated**: April 4, 2026

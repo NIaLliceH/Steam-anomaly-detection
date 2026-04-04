@@ -81,7 +81,7 @@ def load_history(private_ids: set) -> pd.DataFrame:
 
     # Remove duplicates
     before = len(df)
-    df = df.drop_duplicates(subset=["playerid", "achievementid", "date_acquired"], keep="first").reset_index(drop=True)
+    df = df.drop_duplicates(subset=["playerid", "achievementid", "date_acquired"], keep="last").reset_index(drop=True)
     log.info("  Removed %d duplicate rows.", before - len(df))
     log.info("  Final rows: %d", len(df))
     return df
@@ -106,7 +106,7 @@ def load_players(private_ids: set) -> pd.DataFrame:
 
     # Remove duplicates
     before = len(df)
-    df = df.drop_duplicates(subset=["playerid"], keep="first").reset_index(drop=True)
+    df = df.drop_duplicates(subset=["playerid"], keep="last").reset_index(drop=True)
     log.info("  Removed %d duplicate rows.", before - len(df))
     log.info("  Final rows: %d", len(df))
     return df
@@ -137,7 +137,7 @@ def load_reviews(private_ids: set) -> pd.DataFrame:
 
     # Remove duplicates
     before = len(df)
-    df = df.drop_duplicates(subset=["reviewid"], keep="first").reset_index(drop=True)
+    df = df.drop_duplicates(subset=["reviewid"], keep="last").reset_index(drop=True)
     log.info("  Removed %d duplicate rows.", before - len(df))
     log.info("  Final rows: %d", len(df))
     return df
@@ -162,7 +162,7 @@ def load_purchased(private_ids: set) -> pd.DataFrame:
 
     # Remove duplicates
     before = len(df)
-    df = df.drop_duplicates(subset=["playerid"], keep="first").reset_index(drop=True)
+    df = df.drop_duplicates(subset=["playerid"], keep="last").reset_index(drop=True)
     log.info("  Removed %d duplicate rows.", before - len(df))
     log.info("  Final rows: %d", len(df))
     return df
