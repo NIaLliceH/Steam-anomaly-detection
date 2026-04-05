@@ -24,11 +24,27 @@ PROCESSED_DIR = os.path.join(os.path.dirname(__file__), "..", "data", "processed
 # ---------------------------------------------------------------------------
 
 def _parse_list_fast(s: str) -> list:
-    """Parse a Python-style list string using json.loads for speed."""
+    """
+    Parse a Python-style list string or JSON string into a structured list of dicts.
+    Handles both the old format [10, 20, 30] and the new format [{"appid": 10, "playtime_mins": 0}].
+    """
     if not isinstance(s, str) or not s.strip():
         return []
     try:
-        return json.loads(s.replace("'", '"'))
+        parsed_data = json.loads(s.replace("'", '"'))
+        
+        if not parsed_data:
+            return []
+            
+        # Nếu dữ liệu là định dạng cũ (danh sách các số nguyên/chuỗi)
+        if isinstance(parsed_data[0], (int, str)):
+            return [{"appid": int(appid), "playtime_mins": -1} for appid in parsed_data]
+            
+        # Nếu dữ liệu là định dạng mới (danh sách các từ điển)
+        elif isinstance(parsed_data[0], dict):
+            return [{"appid": int(item.get("appid", -1)), "playtime_mins": int(item.get("playtime_mins", -1))} for item in parsed_data if "appid" in item]
+            
+        return []
     except (ValueError, TypeError):
         return []
 
