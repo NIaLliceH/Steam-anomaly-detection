@@ -21,6 +21,7 @@ import pandas as pd
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "src"))
 
+from active_learning import generate_review_sample, integrate_human_labels
 from features import (
     add_time_components,
     build_feature_matrix,
@@ -82,6 +83,11 @@ def main() -> None:
 
     # ── Step 2: Heuristic Labels V2 ───────────────────────────────────────────
     heuristic_df = build_heuristic_labels(history, reviews, player_library)
+
+    # ── Active Learning: integrate human overrides (if reviewed.csv exists) ───
+    reviewed_csv = os.path.join(OUTPUTS_DIR, "reviewed.csv")
+    heuristic_df = integrate_human_labels(heuristic_df, reviewed_csv)
+
     heuristic_path = os.path.join(OUTPUTS_DIR, "heuristic_labels.csv")
     heuristic_df.to_csv(heuristic_path)
     log.info("Saved → %s", heuristic_path)
@@ -146,6 +152,9 @@ def main() -> None:
     ensemble_path = os.path.join(OUTPUTS_DIR, "ensemble_results.csv")
     ensemble_results.to_csv(ensemble_path, index=False)
     log.info("Saved → %s", ensemble_path)
+
+    # ── Active Learning: export high-conflict cases for human review ──────────
+    generate_review_sample(ensemble_results, feature_matrix.loc[common_ids], OUTPUTS_DIR)
 
     # ── Steps 8 & 9: Evaluate + SHAP ──────────────────────────────────────────
     evaluate(
