@@ -22,8 +22,8 @@ log = logging.getLogger(__name__)
 def add_time_components(history: pd.DataFrame) -> pd.DataFrame:
     """Add hour, day_of_week, date_only columns derived from date_acquired."""
     history = history.copy()
-    history["hour"]        = history["date_acquired"].dt.hour.astype("int8")
-    history["day_of_week"] = history["date_acquired"].dt.dayofweek.astype("int8")
+    history["hour"]        = history["date_acquired"].dt.hour.astype("Int8")
+    history["day_of_week"] = history["date_acquired"].dt.dayofweek.astype("Int8")
     history["date_only"]   = history["date_acquired"].dt.date
     return history
 

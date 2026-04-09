@@ -47,6 +47,7 @@ log = logging.getLogger(__name__)
 
 PROCESSED_DIR = os.path.join(os.path.dirname(__file__), "data", "processed")
 OUTPUTS_DIR   = os.path.join(os.path.dirname(__file__), "outputs")
+REVIEWED_CSV = os.path.join(os.path.dirname(__file__), "data", "reviewed.csv")
 
 
 # ---------------------------------------------------------------------------
@@ -85,7 +86,8 @@ def main() -> None:
     heuristic_df = build_heuristic_labels(history, reviews, player_library)
 
     # ── Active Learning: integrate human overrides (if reviewed.csv exists) ───
-    reviewed_csv = os.path.join(OUTPUTS_DIR, "reviewed.csv")
+    # reviewed_csv = os.path.join(OUTPUTS_DIR, "reviewed.csv")
+    reviewed_csv = os.path.join(REVIEWED_CSV)  # Use reviewed.csv from data/ (updated by auto_label.py)
     heuristic_df = integrate_human_labels(heuristic_df, reviewed_csv)
 
     heuristic_path = os.path.join(OUTPUTS_DIR, "heuristic_labels.csv")

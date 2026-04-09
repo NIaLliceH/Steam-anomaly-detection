@@ -23,49 +23,29 @@ RAW_DIR = "data/raw"
 OUTPUTS_DIR = "outputs"
 
 def inject_crawled_data():
-    """Inject data from data/crawled to data/raw, then delete crawl file to avoid duplicate injection.
-    
+    """Check if any crawled data files are present in data/crawled/.
+
+    The actual merging happens in-memory inside src/data_prep.py — raw CSV
+    files are never modified and crawled files are never moved or deleted.
+
     Returns:
-        bool: True if any data was injected, False otherwise
+        bool: True if at least one crawled file exists and is non-empty.
     """
-    print("=== 1. INJECTING NEW DATA ===")
+    print("=== 1. CHECKING FOR NEW CRAWLED DATA ===")
     files = ["players.csv", "purchased_games.csv", "history.csv", "reviews.csv"]
-    injected_any = False
-    
-    archive_folder = os.path.join("data/archive/", f"{pd.Timestamp.now().strftime('%Y%m%d_%H%M%S')}")
+    found_any = False
+
     for file in files:
         crawl_path = os.path.join(CRAWL_DIR, file)
-        raw_path = os.path.join(RAW_DIR, file)
-        
-        if os.path.exists(crawl_path):
-            df_crawl = pd.read_csv(crawl_path)
-            if not df_crawl.empty:
-                if os.path.exists(raw_path):
-                    # Ensure file ends with newline before appending
-                    with open(raw_path, 'r', encoding='utf-8') as f:
-                        content = f.read()
-                    if content and not content.endswith('\n'):
-                        with open(raw_path, 'a', encoding='utf-8') as f:
-                            f.write('\n')
-                    # Append without header
-                    df_crawl.to_csv(raw_path, mode='a', header=False, index=False)
-                else:
-                    # Create new file with header
-                    df_crawl.to_csv(raw_path, index=False)
-                
-                print(f"[+] Injected {len(df_crawl)} records into {file}")
-                injected_any = True
-                
-                # move file to archive
-                os.makedirs(archive_folder, exist_ok=True)
-                os.rename(crawl_path, os.path.join(archive_folder, file))
-                print(f"[+] Moved {file} to {archive_folder}/")
-    
-    
-    if not injected_any:
-        print("[-] No new data to inject.")
-    
-    return injected_any
+        if os.path.exists(crawl_path) and os.path.getsize(crawl_path) > 0:
+            row_count = sum(1 for _ in open(crawl_path, encoding="utf-8")) - 1
+            print(f"[+] Found crawled/{file}  ({row_count} rows — will be merged in-memory during preprocessing)")
+            found_any = True
+
+    if not found_any:
+        print("[-] No crawled data found.")
+
+    return found_any
 
 def run_ml_pipeline():
     """Automatically call Machine Learning scripts"""

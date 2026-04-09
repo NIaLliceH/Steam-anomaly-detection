@@ -9,7 +9,8 @@ log.info("Đọc file raw cũ...")
 old_df = pd.read_csv("data/raw/purchased_games.csv")
 
 log.info("Đọc file vừa crawl...")
-new_df = pd.read_csv("data/crawled/targeted_purchased_games.csv")
+# new_df = pd.read_csv("data/crawled/targeted_purchased_games.csv")
+new_df = pd.read_csv("data/crawled/model_purchased_games.csv")
 
 # 2. Nối (Append) 2 bảng lại với nhau
 combined_df = pd.concat([old_df, new_df], ignore_index=True)

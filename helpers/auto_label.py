@@ -6,8 +6,7 @@ new_df = pd.read_csv('outputs/to_review.csv')
 new_df['human_label'] = 1  # Gán nhãn Bot toàn bộ
 
 # 2. Xử lý cộng dồn (Append) vào file cũ
-reviewed_path = 'outputs/reviewed.csv'
-
+reviewed_path = 'data/reviewed.csv'
 if os.path.exists(reviewed_path):
     # Nếu đã có file từ vòng trước, đọc nó lên
     old_df = pd.read_csv(reviewed_path)
