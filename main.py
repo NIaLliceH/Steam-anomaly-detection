@@ -139,6 +139,18 @@ def main() -> None:
     tuning_results.to_csv(tuning_path, index=False)
     log.info("Saved → %s", tuning_path)
 
+    # Train and save IsolationForest model
+    import joblib
+    best_if_model = None
+    try:
+        from sklearn.ensemble import IsolationForest
+        best_if_model = IsolationForest(**best_if_params)
+        best_if_model.fit(X_scaled)
+        joblib.dump(best_if_model, os.path.join(OUTPUTS_DIR, "best_if.pkl"))
+        log.info("Saved → %s", os.path.join(OUTPUTS_DIR, "best_if.pkl"))
+    except Exception as e:
+        log.error(f"Could not save best_if.pkl: {e}")
+
     # ── Step 5b: XGBoost (PRIMARY model) ─────────────────────────────────────
     best_xgb, xgb_proba, _ = train_xgboost_semisupervised(
         X_log, y_heuristic, y_normal, preprocessor, OUTPUTS_DIR
@@ -172,6 +184,26 @@ def main() -> None:
         outputs_dir            = OUTPUTS_DIR,
     )
 
+    # --- Save model memory for Streamlit app ---
+    import joblib
+    from datetime import datetime
+    model_memory = {
+        "feature_columns": original_feature_names,
+        "baseline_size": int(len(common_ids)),
+        "trained_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "sorted_raw_scores": {
+            "IsolationForest": list(sorted(scores["IsolationForest"])) if "IsolationForest" in scores else [],
+            "XGBoost": list(sorted(xgb_proba)) if xgb_proba is not None else [],
+        },
+        "raw_scores": {
+            "IsolationForest": list(scores["IsolationForest"]) if "IsolationForest" in scores else [],
+            "XGBoost": list(xgb_proba) if xgb_proba is not None else [],
+        },
+        "if_flipped": float(percentile_scores["if_pct"][0]) > float(percentile_scores["if_pct"][-1]) if "if_pct" in percentile_scores else False,
+    }
+    joblib.dump(model_memory, os.path.join(OUTPUTS_DIR, "model_memory.pkl"))
+    log.info("Saved → %s", os.path.join(OUTPUTS_DIR, "model_memory.pkl"))
+    
     log.info("Pipeline complete. All outputs in %s/", OUTPUTS_DIR)
 
 
