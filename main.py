@@ -78,6 +78,8 @@ def main() -> None:
     # ── Load ──────────────────────────────────────────────────────────────────
     history, players, reviews, purchased = load_parquets()
     history = add_time_components(history)
+    feature_reference_time = pd.to_datetime(history["date_acquired"], errors="coerce").max()
+    log.info("Feature reference timestamp (fixed): %s", feature_reference_time)
 
     log.info("Building player library lookup …")
     player_library = build_player_library(purchased)
@@ -96,7 +98,8 @@ def main() -> None:
 
     # ── Step 3: Feature Engineering ──────────────────────────────────────────
     feature_matrix = build_feature_matrix(
-        history, reviews, players, purchased, player_library
+        history, reviews, players, purchased, player_library,
+        reference_time=feature_reference_time,
     )
     fm_path = os.path.join(OUTPUTS_DIR, "feature_matrix.csv")
     feature_matrix.to_csv(fm_path)
@@ -139,6 +142,18 @@ def main() -> None:
     tuning_results.to_csv(tuning_path, index=False)
     log.info("Saved → %s", tuning_path)
 
+    # Train and save IsolationForest model
+    import joblib
+    best_if_model = None
+    try:
+        from sklearn.ensemble import IsolationForest
+        best_if_model = IsolationForest(**best_if_params)
+        best_if_model.fit(X_scaled)
+        joblib.dump(best_if_model, os.path.join(OUTPUTS_DIR, "best_if.pkl"))
+        log.info("Saved → %s", os.path.join(OUTPUTS_DIR, "best_if.pkl"))
+    except Exception as e:
+        log.error(f"Could not save best_if.pkl: {e}")
+
     # ── Step 5b: XGBoost (PRIMARY model) ─────────────────────────────────────
     best_xgb, xgb_proba, _ = train_xgboost_semisupervised(
         X_log, y_heuristic, y_normal, preprocessor, OUTPUTS_DIR
@@ -172,6 +187,27 @@ def main() -> None:
         outputs_dir            = OUTPUTS_DIR,
     )
 
+    # --- Save model memory for Streamlit app ---
+    import joblib
+    from datetime import datetime
+    model_memory = {
+        "feature_columns": original_feature_names,
+        "baseline_size": int(len(common_ids)),
+        "trained_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "feature_reference_time": None if pd.isna(feature_reference_time) else pd.Timestamp(feature_reference_time).isoformat(),
+        "sorted_raw_scores": {
+            "IsolationForest": list(sorted(scores["IsolationForest"])) if "IsolationForest" in scores else [],
+            "XGBoost": list(sorted(xgb_proba)) if xgb_proba is not None else [],
+        },
+        "raw_scores": {
+            "IsolationForest": list(scores["IsolationForest"]) if "IsolationForest" in scores else [],
+            "XGBoost": list(xgb_proba) if xgb_proba is not None else [],
+        },
+        "if_flipped": bool(percentile_scores.get("if_flipped", False)),
+    }
+    joblib.dump(model_memory, os.path.join(OUTPUTS_DIR, "model_memory.pkl"))
+    log.info("Saved → %s", os.path.join(OUTPUTS_DIR, "model_memory.pkl"))
+    
     log.info("Pipeline complete. All outputs in %s/", OUTPUTS_DIR)
 
 

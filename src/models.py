@@ -292,10 +292,12 @@ def build_ensemble(scores: dict,
 
     # Auto-detect IF score inversion: if AUC < 0.4, flip scores.
     if_auc = roc_auc_score(y_heuristic, if_pct)
+    if_flipped = False
     log.info("  IF AUC check: %.4f", if_auc)
     if if_auc < 0.4:
         log.warning("  IF scores appear inverted (AUC=%.4f) — flipping!", if_auc)
         if_pct = 100.0 - if_pct
+        if_flipped = True
 
     if xgb_proba is not None:
         xgb_pct   = rankdata(xgb_proba) / len(xgb_proba) * 100
@@ -328,5 +330,6 @@ def build_ensemble(scores: dict,
         "xgb_pct":   xgb_pct,
         "if_pct":    if_pct,
         "composite": composite,
+        "if_flipped": if_flipped,
     }
     return ensemble_results, percentile_scores
