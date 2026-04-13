@@ -360,7 +360,11 @@ def _review_features(reviews: pd.DataFrame, player_library: dict) -> pd.DataFram
     )
 
 
-def _account_age_features(history: pd.DataFrame, players: pd.DataFrame) -> pd.DataFrame:
+def _account_age_features(
+    history: pd.DataFrame,
+    players: pd.DataFrame,
+    reference_time: pd.Timestamp | None = None,
+) -> pd.DataFrame:
     """Bonus: account age and time-to-first-achievement."""
     player_created = players.set_index("playerid")["created"]
     first_ach      = history.groupby("playerid")["date_acquired"].min()
@@ -371,8 +375,9 @@ def _account_age_features(history: pd.DataFrame, players: pd.DataFrame) -> pd.Da
         .clip(lower=0)
         .rename("days_before_first_achievement")
     )
+    ref_ts = pd.Timestamp.now() if reference_time is None else pd.Timestamp(reference_time)
     account_age = (
-        (pd.Timestamp.now() - player_created)
+        (ref_ts - player_created)
         .dt.days
         .rename("account_age_days")
     )
@@ -383,7 +388,8 @@ def build_feature_matrix(history: pd.DataFrame,
                           reviews: pd.DataFrame,
                           players: pd.DataFrame,
                           purchased: pd.DataFrame,
-                          player_library: dict) -> pd.DataFrame:
+                          player_library: dict,
+                          reference_time: pd.Timestamp | None = None) -> pd.DataFrame:
     """
     Step 3: Compute all 23 per-player features across 5 groups.
     Players appearing only in reviews (0 achievements) get NaN for
@@ -415,7 +421,7 @@ def build_feature_matrix(history: pd.DataFrame,
     )
 
     log.info("  Group E: account age features …") # Sửa lại log info
-    grp_bonus = _account_age_features(history, players)
+    grp_bonus = _account_age_features(history, players, reference_time=reference_time)
 
     log.info("  Group F: playtime features …")
     grp_playtime = _playtime_features(history, purchased)

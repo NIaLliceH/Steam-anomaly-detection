@@ -483,6 +483,23 @@ def load_model_bundle() -> dict | None:
         "models": models,
     }
 
+
+@st.cache_resource(show_spinner=False)
+def load_feature_matrix_lookup() -> pd.DataFrame | None:
+    """Load feature_matrix indexed by playerid for exact train-online parity."""
+    path = "outputs/feature_matrix.csv"
+    if not os.path.exists(path):
+        return None
+
+    df = pd.read_csv(path, dtype={"playerid": "string"})
+    if "playerid" not in df.columns:
+        return None
+
+    ids = pd.to_numeric(df["playerid"], errors="coerce")
+    df = df[ids.notna()].copy()
+    df["playerid"] = ids[ids.notna()].astype("int64")
+    return df.drop_duplicates(subset=["playerid"], keep="last").set_index("playerid")
+
 # Fetch sorted baseline scores for a model, sorting raw scores when needed.
 def _get_sorted_baseline(memory: dict, key: str) -> np.ndarray:
     sorted_map = memory.get("sorted_raw_scores", {})
@@ -624,7 +641,18 @@ def infer_online_profiles_batch(feature_profiles: list[dict], bundle: dict) -> l
     return results
 
 # Rebuild a temporary profile from crawl tables for one Steam ID.
-def compute_temp_profile(pid: int, crawled: dict[str, pd.DataFrame | None]) -> dict:
+def compute_temp_profile(
+    pid: int,
+    crawled: dict[str, pd.DataFrame | None],
+    model_memory: dict | None = None,
+) -> dict:
+    # For IDs present in training feature matrix, use the exact same row as training.
+    fm_lookup = load_feature_matrix_lookup()
+    if fm_lookup is not None and pid in fm_lookup.index:
+        row = fm_lookup.loc[pid].to_dict()
+        row["playerid"] = int(pid)
+        return row
+
     players_c = crawled.get("players")
     purchased_c = crawled.get("purchased")
     history_c = crawled.get("history")
@@ -734,8 +762,13 @@ def compute_temp_profile(pid: int, crawled: dict[str, pd.DataFrame | None]) -> d
 
     created_raw = row.get("created")
     created_dt = pd.to_datetime(created_raw, errors="coerce")
+    ref_time = pd.NaT
+    if model_memory is not None:
+        ref_time = pd.to_datetime(model_memory.get("feature_reference_time"), errors="coerce")
+    if pd.isna(ref_time):
+        ref_time = pd.Timestamp.now()
     if pd.notna(created_dt):
-        row["account_age_days"] = float((pd.Timestamp.now() - created_dt).days)
+        row["account_age_days"] = float((ref_time - created_dt).days)
         if not h.empty:
             row["days_before_first_achievement"] = float((h["date_acquired"].min() - created_dt).days)
 
@@ -944,6 +977,7 @@ if train_proc is not None and not is_running and st.session_state.get("train_las
     st.session_state["train_proc"] = None
     if rc == 0:
         load_model_bundle.clear()
+        load_feature_matrix_lookup.clear()
 
 button_label = "Running..." if is_running else "Run Crawl Training"
 
@@ -1033,7 +1067,7 @@ with c2:
                 data_quality_warnings = {}  # pid -> reason mapping
                 for pid in eligible_ids:
                     try:
-                        profile = compute_temp_profile(pid, crawled)
+                        profile = compute_temp_profile(pid, crawled, bundle.get("memory"))
                         is_quality_ok, reason = online_data_quality_gate(profile)
                         if not is_quality_ok:
                             data_quality_warnings[str(pid)] = reason

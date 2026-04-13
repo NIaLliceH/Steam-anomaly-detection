@@ -78,6 +78,8 @@ def main() -> None:
     # ── Load ──────────────────────────────────────────────────────────────────
     history, players, reviews, purchased = load_parquets()
     history = add_time_components(history)
+    feature_reference_time = pd.to_datetime(history["date_acquired"], errors="coerce").max()
+    log.info("Feature reference timestamp (fixed): %s", feature_reference_time)
 
     log.info("Building player library lookup …")
     player_library = build_player_library(purchased)
@@ -96,7 +98,8 @@ def main() -> None:
 
     # ── Step 3: Feature Engineering ──────────────────────────────────────────
     feature_matrix = build_feature_matrix(
-        history, reviews, players, purchased, player_library
+        history, reviews, players, purchased, player_library,
+        reference_time=feature_reference_time,
     )
     fm_path = os.path.join(OUTPUTS_DIR, "feature_matrix.csv")
     feature_matrix.to_csv(fm_path)
@@ -191,6 +194,7 @@ def main() -> None:
         "feature_columns": original_feature_names,
         "baseline_size": int(len(common_ids)),
         "trained_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "feature_reference_time": None if pd.isna(feature_reference_time) else pd.Timestamp(feature_reference_time).isoformat(),
         "sorted_raw_scores": {
             "IsolationForest": list(sorted(scores["IsolationForest"])) if "IsolationForest" in scores else [],
             "XGBoost": list(sorted(xgb_proba)) if xgb_proba is not None else [],
@@ -199,7 +203,7 @@ def main() -> None:
             "IsolationForest": list(scores["IsolationForest"]) if "IsolationForest" in scores else [],
             "XGBoost": list(xgb_proba) if xgb_proba is not None else [],
         },
-        "if_flipped": float(percentile_scores["if_pct"][0]) > float(percentile_scores["if_pct"][-1]) if "if_pct" in percentile_scores else False,
+        "if_flipped": bool(percentile_scores.get("if_flipped", False)),
     }
     joblib.dump(model_memory, os.path.join(OUTPUTS_DIR, "model_memory.pkl"))
     log.info("Saved → %s", os.path.join(OUTPUTS_DIR, "model_memory.pkl"))
