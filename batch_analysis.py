@@ -23,49 +23,29 @@ RAW_DIR = "data/raw"
 OUTPUTS_DIR = "outputs"
 
 def inject_crawled_data():
-    """Inject data from data/crawled to data/raw, then delete crawl file to avoid duplicate injection.
-    
+    """Check if any crawled data files are present in data/crawled/.
+
+    The actual merging happens in-memory inside src/data_prep.py — raw CSV
+    files are never modified and crawled files are never moved or deleted.
+
     Returns:
-        bool: True if any data was injected, False otherwise
+        bool: True if at least one crawled file exists and is non-empty.
     """
-    print("=== 1. INJECTING NEW DATA ===")
+    print("=== 1. CHECKING FOR NEW CRAWLED DATA ===")
     files = ["players.csv", "purchased_games.csv", "history.csv", "reviews.csv"]
-    injected_any = False
-    
-    archive_folder = os.path.join("data/archive/", f"{pd.Timestamp.now().strftime('%Y%m%d_%H%M%S')}")
+    found_any = False
+
     for file in files:
         crawl_path = os.path.join(CRAWL_DIR, file)
-        raw_path = os.path.join(RAW_DIR, file)
-        
-        if os.path.exists(crawl_path):
-            df_crawl = pd.read_csv(crawl_path)
-            if not df_crawl.empty:
-                if os.path.exists(raw_path):
-                    # Ensure file ends with newline before appending
-                    with open(raw_path, 'r', encoding='utf-8') as f:
-                        content = f.read()
-                    if content and not content.endswith('\n'):
-                        with open(raw_path, 'a', encoding='utf-8') as f:
-                            f.write('\n')
-                    # Append without header
-                    df_crawl.to_csv(raw_path, mode='a', header=False, index=False)
-                else:
-                    # Create new file with header
-                    df_crawl.to_csv(raw_path, index=False)
-                
-                print(f"[+] Injected {len(df_crawl)} records into {file}")
-                injected_any = True
-                
-                # move file to archive
-                os.makedirs(archive_folder, exist_ok=True)
-                os.rename(crawl_path, os.path.join(archive_folder, file))
-                print(f"[+] Moved {file} to {archive_folder}/")
-    
-    
-    if not injected_any:
-        print("[-] No new data to inject.")
-    
-    return injected_any
+        if os.path.exists(crawl_path) and os.path.getsize(crawl_path) > 0:
+            row_count = sum(1 for _ in open(crawl_path, encoding="utf-8")) - 1
+            print(f"[+] Found crawled/{file}  ({row_count} rows — will be merged in-memory during preprocessing)")
+            found_any = True
+
+    if not found_any:
+        print("[-] No crawled data found.")
+
+    return found_any
 
 def run_ml_pipeline():
     """Automatically call Machine Learning scripts"""
@@ -178,8 +158,6 @@ def build_report_data(target_ids):
             'is_bot': is_bot,
             'status': "ANOMALY DETECTED (BOT/FRAUD)" if is_bot else "NORMAL PLAYER",
             'if_pct': res.iloc[0]['if_pct'],
-            'lof_pct': res.iloc[0]['lof_pct'],
-            'svm_pct': res.iloc[0]['svm_pct'],
             'max_achievements_per_day': user_feat.get('max_achievements_per_day', 0),
             'normal_avg_achievements': normal_mean['max_achievements_per_day'],
             'review_unowned_ratio': user_feat.get('review_unowned_ratio', 0),
@@ -214,10 +192,8 @@ def generate_markdown_report(target_ids):
         status_icon = "🚨" if entry['is_bot'] else "✅"
         md += f"**Status:** {status_icon} {entry['status']}\n\n"
         md += f"**AI Suspicion Score:** {entry['score']:.2f} / 100\n\n"
-        md += f"**Model Votes:**\n"
-        md += f"- Isolation Forest: {entry['if_pct']:.1f}%\n"
-        md += f"- Local Outlier Factor: {entry['lof_pct']:.1f}%\n"
-        md += f"- SVM: {entry['svm_pct']:.1f}%\n\n"
+        md += f"**Model Scores:**\n"
+        md += f"- Isolation Forest: {entry['if_pct']:.1f}%\n\n"
         
         if entry['is_bot']:
             md += "### Behavior Evidence (Why flagged?)\n\n"
@@ -418,8 +394,6 @@ def generate_html_report(target_ids):
         html += f'<div class="score-display">{entry["score"]:.2f}</div>\n'
         html += '<div class="model-votes">\n'
         html += f'<div class="vote-item"><div class="vote-label">Isolation Forest</div><div class="vote-percent">{entry["if_pct"]:.1f}%</div></div>\n'
-        html += f'<div class="vote-item"><div class="vote-label">Local Outlier Factor</div><div class="vote-percent">{entry["lof_pct"]:.1f}%</div></div>\n'
-        html += f'<div class="vote-item"><div class="vote-label">SVM</div><div class="vote-percent">{entry["svm_pct"]:.1f}%</div></div>\n'
         html += '</div>\n</div>\n'
         
         if entry['is_bot']:
@@ -484,7 +458,7 @@ def generate_report(target_ids, output_format='console'):
             print(f"\nSTEAM ID: {pid}")
             print(f"   Status: {status}")
             print(f"   AI Suspicion Score: {score:.2f} / 100")
-            print(f"   Model Votes: IF={entry['if_pct']:.1f}%, LOF={entry['lof_pct']:.1f}%, SVM={entry['svm_pct']:.1f}%")
+            print(f"   Model Scores: IF={entry['if_pct']:.1f}%")
             
             if entry['is_bot']:
                 print("   BEHAVIOR EVIDENCE (Why flagged?):")
@@ -527,6 +501,7 @@ Examples:
   python3 batch_analysis.py                           # Full pipeline (if new data exists)
   python3 batch_analysis.py --query-only              # Skip injection, query existing results only
   python3 batch_analysis.py --query-only --steam-ids 123 456  # Query specific player IDs
+  python3 batch_analysis.py --force-run               # Force run pipeline even without new data
         """
     )
     
@@ -550,6 +525,12 @@ Examples:
         help='Report output format (default: all)'
     )
     
+    parser.add_argument(
+        '--force-run',
+        action='store_true',
+        help='Force run the entire pipeline even if no new data is injected'
+    )
+    
     args = parser.parse_args()
     
     # Determine target IDs
@@ -564,7 +545,7 @@ Examples:
         # Inject data and check if anything was injected
         data_injected = inject_crawled_data()
         
-        if data_injected:
+        if data_injected or args.force_run:
             print("\n=== 2. RUNNING AI PIPELINE (Please wait...) ===")
             print("[*] Running Phase 1 (Data Prep)...")
             subprocess.run(["python3", "src/data_prep.py"], check=True)

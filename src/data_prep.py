@@ -15,7 +15,8 @@ logging.basicConfig(
 )
 log = logging.getLogger(__name__)
 
-RAW_DIR = os.path.join(os.path.dirname(__file__), "..", "data", "raw")
+RAW_DIR     = os.path.join(os.path.dirname(__file__), "..", "data", "raw")
+CRAWLED_DIR = os.path.join(os.path.dirname(__file__), "..", "data", "crawled")
 PROCESSED_DIR = os.path.join(os.path.dirname(__file__), "..", "data", "processed")
 
 
@@ -24,17 +25,89 @@ PROCESSED_DIR = os.path.join(os.path.dirname(__file__), "..", "data", "processed
 # ---------------------------------------------------------------------------
 
 def _parse_list_fast(s: str) -> list:
-    """Parse a Python-style list string using json.loads for speed."""
+    """
+    Parse a Python-style list string or JSON string into a structured list of dicts.
+    Handles both the old format [10, 20, 30] and the new format [{"appid": 10, "playtime_mins": 0}].
+    """
     if not isinstance(s, str) or not s.strip():
         return []
     try:
-        return json.loads(s.replace("'", '"'))
+        parsed_data = json.loads(s.replace("'", '"'))
+        
+        if not parsed_data:
+            return []
+            
+        # Nếu dữ liệu là định dạng cũ (danh sách các số nguyên/chuỗi)
+        if isinstance(parsed_data[0], (int, str)):
+            return [{"appid": int(appid), "playtime_mins": -1} for appid in parsed_data]
+            
+        # Nếu dữ liệu là định dạng mới (danh sách các từ điển)
+        elif isinstance(parsed_data[0], dict):
+            return [{"appid": int(item.get("appid", -1)), "playtime_mins": int(item.get("playtime_mins", -1))} for item in parsed_data if "appid" in item]
+            
+        return []
     except (ValueError, TypeError):
         return []
 
 
 def _raw(filename: str) -> str:
     return os.path.join(RAW_DIR, filename)
+
+
+def _merge_with_crawled(df_raw: pd.DataFrame, filename: str) -> pd.DataFrame:
+    """
+    If data/crawled/<filename> exists, read it and concat with df_raw in RAM.
+    The raw CSV files are never modified.
+    """
+    crawled_path = os.path.join(CRAWLED_DIR, filename)
+    if not os.path.exists(crawled_path):
+        return df_raw
+    df_crawled = pd.read_csv(crawled_path)
+    if df_crawled.empty:
+        return df_raw
+    log.info("  Found crawled/%s — merging %d rows in RAM.", filename, len(df_crawled))
+    return pd.concat([df_raw, df_crawled], ignore_index=True)
+
+
+def _read_purchased_robust(path: str) -> pd.DataFrame:
+    """
+    Read a purchased_games CSV that may contain malformed rows where the
+    library JSON column has unescaped inner quotes.
+    """
+    import csv as _csv
+
+    _csv.field_size_limit(10_000_000)
+    rows = []
+    bad_lines: set[int] = set()
+
+    with open(path, "r", newline="", encoding="utf-8") as f:
+        reader = _csv.reader(f)
+        next(reader)  # skip header
+        for lineno, row in enumerate(reader, start=2):
+            if len(row) == 2:
+                rows.append({"playerid": row[0], "library": row[1]})
+            else:
+                bad_lines.add(lineno)
+
+    if bad_lines:
+        log.warning("  %s: %d malformed rows — repairing…", os.path.basename(path), len(bad_lines))
+        with open(path, "r", encoding="utf-8") as f:
+            next(f)
+            for lineno, raw_line in enumerate(f, start=2):
+                if lineno not in bad_lines:
+                    continue
+                raw_line = raw_line.rstrip("\n")
+                comma_idx = raw_line.index(",")
+                playerid  = raw_line[:comma_idx]
+                rest      = raw_line[comma_idx + 1:]
+                library   = rest[1:-1] if (rest.startswith('"') and rest.endswith('"')) else rest
+                try:
+                    json.loads(library)
+                    rows.append({"playerid": playerid, "library": library})
+                except (ValueError, TypeError):
+                    log.warning("  Line %d: repair failed, skipping.", lineno)
+
+    return pd.DataFrame(rows, columns=["playerid", "library"])
 
 
 # ---------------------------------------------------------------------------
@@ -60,6 +133,7 @@ def load_history(private_ids: set) -> pd.DataFrame:
         usecols=["playerid", "achievementid", "date_acquired"],
         dtype={"playerid": "int64", "achievementid": "string"},
     )
+    df = _merge_with_crawled(df, "history.csv")
     log.info("  Raw rows: %d", len(df))
 
     # Extract gameid safely — achievement names may contain underscores
@@ -94,6 +168,7 @@ def load_players(private_ids: set) -> pd.DataFrame:
         usecols=["playerid", "country", "created"],
         dtype={"playerid": "int64", "country": "category"},
     )
+    df = _merge_with_crawled(df, "players.csv")
     log.info("  Raw rows: %d", len(df))
 
     df["created"] = pd.to_datetime(
@@ -127,6 +202,7 @@ def load_reviews(private_ids: set) -> pd.DataFrame:
             "review": "string",
         },
     )
+    df = _merge_with_crawled(df, "reviews.csv")
     log.info("  Raw rows: %d", len(df))
 
     df["posted"] = pd.to_datetime(df["posted"], format="%Y-%m-%d", errors="coerce")
@@ -145,11 +221,14 @@ def load_reviews(private_ids: set) -> pd.DataFrame:
 
 def load_purchased(private_ids: set) -> pd.DataFrame:
     log.info("Loading purchased_games.csv …")
-    df = pd.read_csv(
-        _raw("purchased_games.csv"),
-        usecols=["playerid", "library"],
-        dtype={"playerid": "int64", "library": "string"},
-    )
+    df = _read_purchased_robust(_raw("purchased_games.csv"))
+    crawled_path = os.path.join(CRAWLED_DIR, "purchased_games.csv")
+    if os.path.exists(crawled_path):
+        df_crawled = _read_purchased_robust(crawled_path)
+        if not df_crawled.empty:
+            log.info("  Found crawled/purchased_games.csv — merging %d rows in RAM.", len(df_crawled))
+            df = pd.concat([df, df_crawled], ignore_index=True)
+    df["playerid"] = df["playerid"].astype("int64")
     log.info("  Raw rows: %d", len(df))
 
     # Fast list parsing instead of ast.literal_eval

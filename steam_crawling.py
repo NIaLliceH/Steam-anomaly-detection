@@ -4,6 +4,7 @@ from datetime import datetime
 import time
 import os
 import csv
+import json
 import argparse
 from dotenv import load_dotenv
 from bs4 import BeautifulSoup
@@ -76,15 +77,20 @@ def crawl_library(steam_id):
         "include_played_free_games": 1
     }
     data = get_json(url, params)
-    
+
     if not data or 'response' not in data or 'games' not in data['response']:
         return None, []
-    
-    app_ids = [game['appid'] for game in data['response']['games']]
-    
+
+    games = data['response']['games']
+    app_ids = [g['appid'] for g in games]
+    library_json = json.dumps(
+        [{"appid": g["appid"], "playtime_mins": g.get("playtime_forever", 0)} for g in games],
+        separators=(",", ":")
+    )
+
     df = pd.DataFrame([{
         "playerid": steam_id,
-        "library": str(app_ids)  # Format list thành chuỗi như dataset Kaggle
+        "library": library_json
     }])
     return df, app_ids
 

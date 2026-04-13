@@ -1,18 +1,11 @@
 """
 Phase 2 — Steps 4–7: Preprocessing, Hyperparameter Tuning, Training, Ensemble.
 
-V2 changes:
-- preprocess() now includes PCA (90% variance retained) after RobustScaler.
-  PCA reduces the 25-feature space to ~8-12 components, removing noise and
-  multicollinearity that hurt LOF and OCSVM distance calculations.
-- train_xgboost_semisupervised() is the new PRIMARY model.  XGBoost is trained
-  on the refined heuristic labels (V2 AND logic) via RandomizedSearchCV.
-- build_ensemble() is updated:
-    * XGBoost score gets weight 0.50 (new primary).
-    * LOF keeps weight 0.30.
-    * IF drops to 0.15 (was 0.50) — IF ROC-AUC was 0.0052, indicating an
-      inverted score; the ensemble now auto-detects and flips IF if needed.
-    * OCSVM keeps weight 0.05.
+V3 "Dynamic Duo" architecture:
+- XGBoost (PRIMARY, weight 0.80): Semi-supervised PU Learning on heuristic labels.
+- IsolationForest (SECONDARY, weight 0.20): Unsupervised anomaly detection.
+- LOF and OCSVM removed — O(N²) bottleneck with insufficient weight/performance.
+- Ensemble anomaly flag: composite_score >= 85 (high-confidence threshold).
 """
 
 import logging
@@ -27,15 +20,10 @@ from sklearn.ensemble import IsolationForest
 from sklearn.impute import SimpleImputer
 from sklearn.metrics import roc_auc_score, average_precision_score
 from sklearn.model_selection import ParameterGrid, RandomizedSearchCV, StratifiedKFold
-from sklearn.neighbors import LocalOutlierFactor
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import StandardScaler
-from sklearn.svm import OneClassSVM
 
 log = logging.getLogger(__name__)
-
-# LOF and OCSVM are O(N²) — cap training size to avoid OOM
-_LOF_SVM_SAMPLE = 20_000
 
 # Heavy-tailed features whose raw distributions span many orders of magnitude.
 # Without log-compression, RobustScaler still leaves extreme outliers that
@@ -73,13 +61,6 @@ def apply_log_transform(X_raw: pd.DataFrame) -> pd.DataFrame:
     return X
 
 
-def _draw_sample(X: np.ndarray, n: int, seed: int = 42) -> tuple[np.ndarray, np.ndarray]:
-    """Return (X_sample, sample_indices) of size min(n, len(X))."""
-    rng = np.random.default_rng(seed)
-    idx = rng.choice(len(X), min(n, len(X)), replace=False)
-    return X[idx], idx
-
-
 # ---------------------------------------------------------------------------
 # Step 4 — Preprocessing with PCA
 # ---------------------------------------------------------------------------
@@ -87,13 +68,11 @@ def _draw_sample(X: np.ndarray, n: int, seed: int = 42) -> tuple[np.ndarray, np.
 def preprocess(X_raw: pd.DataFrame, save_path: str,
                pca_variance: float = 0.90) -> tuple[np.ndarray, Pipeline, list]:
     """
-    Fit Imputer → RobustScaler → PCA pipeline and persist it.
+    Fit Imputer → StandardScaler → PCA pipeline and persist it.
 
     PCA retains `pca_variance` fraction of explained variance (default 90%).
-    This typically reduces 25 features to 8-12 PCA components, which:
-    - Removes noise and multicollinearity (correlated speed/concentration features)
-    - Improves LOF/OCSVM distance accuracy in lower-dimensional space
-    - Cuts LOF/OCSVM compute time
+    This typically reduces 25 features to 8-12 PCA components, removing noise
+    and multicollinearity before model training.
     """
     log.info("Step 4 — Preprocessing (Imputer + StandardScaler + PCA) …")
     # StandardScaler replaces RobustScaler: after log1p the heavy-tailed
@@ -127,11 +106,16 @@ def preprocess(X_raw: pd.DataFrame, save_path: str,
 
 
 # ---------------------------------------------------------------------------
-# Step 5 — Hyperparameter Tuning (unsupervised models)
+# Step 5 — Hyperparameter Tuning (IsolationForest)
 # ---------------------------------------------------------------------------
 
-def _tune_isolation_forest(X_scaled: np.ndarray,
-                            y: pd.Series) -> tuple[pd.DataFrame, dict]:
+def tune_models(X_scaled: np.ndarray,
+                y_heuristic: pd.Series) -> tuple[dict, pd.DataFrame]:
+    """
+    Grid-search IsolationForest and return best params + tuning results.
+    ROC-AUC measures fit to heuristic labels (pseudo ground truth).
+    """
+    log.info("Step 5 — Hyperparameter tuning (IsolationForest) …")
     param_grid = {
         "n_estimators":  [100, 200, 300],
         "max_samples":   ["auto", 0.8, 0.6],
@@ -147,85 +131,17 @@ def _tune_isolation_forest(X_scaled: np.ndarray,
         m = IsolationForest(**params)
         m.fit(X_scaled)
         scores = -m.score_samples(X_scaled)
-        auc = roc_auc_score(y, scores)
+        auc = roc_auc_score(y_heuristic, scores)
         rows.append({**params, "roc_auc": auc, "runtime_s": time.time() - t0})
 
-    df = pd.DataFrame(rows).sort_values("roc_auc", ascending=False)
-    best = df.iloc[0].drop(["roc_auc", "runtime_s"]).to_dict()
-    best["n_estimators"] = int(best["n_estimators"])
-    best["random_state"]  = int(best["random_state"])
-    log.info("    Best IF  ROC-AUC=%.4f  %s", df.iloc[0]["roc_auc"], best)
-    return df, best
+    if_df = pd.DataFrame(rows).sort_values("roc_auc", ascending=False)
+    best_if = if_df.iloc[0].drop(["roc_auc", "runtime_s"]).to_dict()
+    best_if["n_estimators"] = int(best_if["n_estimators"])
+    best_if["random_state"]  = int(best_if["random_state"])
+    log.info("    Best IF  ROC-AUC=%.4f  %s", if_df.iloc[0]["roc_auc"], best_if)
 
-
-def _tune_lof(X_scaled: np.ndarray, X_sample: np.ndarray,
-              y: pd.Series) -> tuple[pd.DataFrame, dict]:
-    log.info("  Tuning LOF (novelty=True, sample=%d) …", len(X_sample))
-    param_grid = {
-        "n_neighbors":   [10, 20, 30, 50],
-        "contamination": [0.02, 0.05, 0.10],
-        "metric":        ["euclidean", "manhattan"],
-    }
-    rows = []
-    for params in ParameterGrid(param_grid):
-        t0 = time.time()
-        m = LocalOutlierFactor(novelty=True, **params)
-        m.fit(X_sample)
-        scores = -m.score_samples(X_scaled)
-        auc = roc_auc_score(y, scores)
-        rows.append({**params, "roc_auc": auc, "runtime_s": time.time() - t0})
-
-    df = pd.DataFrame(rows).sort_values("roc_auc", ascending=False)
-    best = df.iloc[0].drop(["roc_auc", "runtime_s"]).to_dict()
-    best["n_neighbors"] = int(best["n_neighbors"])
-    log.info("    Best LOF ROC-AUC=%.4f  %s", df.iloc[0]["roc_auc"], best)
-    return df, best
-
-
-def _tune_ocsvm(X_scaled: np.ndarray, X_sample: np.ndarray,
-                y: pd.Series) -> tuple[pd.DataFrame, dict]:
-    log.info("  Tuning OneClassSVM (sample=%d) …", len(X_sample))
-    param_grid = {
-        "kernel": ["rbf"],
-        "gamma":  ["scale", "auto", 0.001, 0.01],
-        "nu":     [0.01, 0.05, 0.10],
-    }
-    rows = []
-    for params in ParameterGrid(param_grid):
-        t0 = time.time()
-        m = OneClassSVM(**params)
-        m.fit(X_sample)
-        scores = -m.score_samples(X_scaled)
-        auc = roc_auc_score(y, scores)
-        rows.append({**params, "roc_auc": auc, "runtime_s": time.time() - t0})
-
-    df = pd.DataFrame(rows).sort_values("roc_auc", ascending=False)
-    best = df.iloc[0].drop(["roc_auc", "runtime_s"]).to_dict()
-    log.info("    Best SVM ROC-AUC=%.4f  %s", df.iloc[0]["roc_auc"], best)
-    return df, best
-
-
-def tune_models(X_scaled: np.ndarray,
-                y_heuristic: pd.Series) -> tuple[dict, dict, dict, pd.DataFrame]:
-    """
-    Grid-search IF / LOF / OCSVM and return best params + tuning results.
-    ROC-AUC here measures fit to heuristic labels (pseudo ground truth), not
-    true anomaly detection accuracy.
-    """
-    log.info("Step 5 — Hyperparameter tuning …")
-    X_sample, _ = _draw_sample(X_scaled, _LOF_SVM_SAMPLE)
-
-    if_df,  best_if  = _tune_isolation_forest(X_scaled, y_heuristic)
-    lof_df, best_lof = _tune_lof(X_scaled, X_sample, y_heuristic)
-    svm_df, best_svm = _tune_ocsvm(X_scaled, X_sample, y_heuristic)
-
-    tuning_results = pd.concat([
-        if_df.assign(model="IsolationForest"),
-        lof_df.assign(model="LOF"),
-        svm_df.assign(model="OCSVM"),
-    ], ignore_index=True)
-
-    return best_if, best_lof, best_svm, tuning_results
+    tuning_results = if_df.assign(model="IsolationForest")
+    return best_if, tuning_results
 
 
 # ---------------------------------------------------------------------------
@@ -336,38 +252,22 @@ def train_xgboost_semisupervised(
 
 
 # ---------------------------------------------------------------------------
-# Step 6 — Train Final Unsupervised Models
+# Step 6 — Train Final IsolationForest
 # ---------------------------------------------------------------------------
 
 def train_best_models(X_scaled: np.ndarray,
-                      best_if_params: dict,
-                      best_lof_params: dict,
-                      best_svm_params: dict) -> tuple[dict, dict]:
+                      best_if_params: dict) -> tuple[dict, dict]:
     """
-    Retrain each unsupervised model on the full (scaled/PCA'd) data.
-    LOF and OCSVM still train on a 20k sample to stay within memory.
+    Retrain IsolationForest on the full (scaled/PCA'd) data.
     Returns (models_dict, raw_scores_dict) — higher score = more anomalous.
     """
-    log.info("Step 6 — Training final models …")
-    X_sample, _ = _draw_sample(X_scaled, _LOF_SVM_SAMPLE)
-
-    log.info("  IsolationForest …")
+    log.info("Step 6 — Training IsolationForest …")
     best_if = IsolationForest(**best_if_params)
     best_if.fit(X_scaled)
     if_scores = -best_if.score_samples(X_scaled)
 
-    log.info("  LOF …")
-    best_lof = LocalOutlierFactor(novelty=True, **best_lof_params)
-    best_lof.fit(X_sample)
-    lof_scores = -best_lof.score_samples(X_scaled)
-
-    log.info("  OneClassSVM …")
-    best_svm = OneClassSVM(**best_svm_params)
-    best_svm.fit(X_sample)
-    svm_scores = -best_svm.score_samples(X_scaled)
-
-    models = {"IsolationForest": best_if, "LOF": best_lof, "OCSVM": best_svm}
-    scores = {"IsolationForest": if_scores, "LOF": lof_scores, "OCSVM": svm_scores}
+    models = {"IsolationForest": best_if}
+    scores = {"IsolationForest": if_scores}
     return models, scores
 
 
@@ -381,47 +281,35 @@ def build_ensemble(scores: dict,
                    xgb_proba: np.ndarray | None = None) -> tuple[pd.DataFrame, dict]:
     """
     Percentile-rank each model (0–100, higher = more suspicious).
-    XGBoost is the primary model (weight 0.50).
-    IF weight is reduced to 0.15; auto-flip if AUC < 0.4 indicates inversion.
 
-    Weights: XGB=0.50, LOF=0.30, IF=0.15, OCSVM=0.05
-    Flag threshold: top 5% per model; anomaly if ≥ 2 models agree.
+    Weights: XGB=0.80 (primary), IF=0.20 (secondary).
+    IF auto-flip: if ROC-AUC < 0.4, scores are inverted and flipped.
+    Anomaly flag: composite_score >= 85 (high-confidence threshold).
     """
-    log.info("Step 7 — Building ensemble …")
-    if_scores  = scores["IsolationForest"]
-    lof_scores = scores["LOF"]
-    svm_scores = scores["OCSVM"]
+    log.info("Step 7 — Building ensemble (Dynamic Duo: XGB + IF) …")
+    if_scores = scores["IsolationForest"]
+    if_pct    = rankdata(if_scores) / len(if_scores) * 100
 
-    if_pct  = rankdata(if_scores)  / len(if_scores)  * 100
-    lof_pct = rankdata(lof_scores) / len(lof_scores) * 100
-    svm_pct = rankdata(svm_scores) / len(svm_scores) * 100
-
-    # Auto-detect IF score inversion (Bug #1): if AUC < 0.4, flip scores.
+    # Auto-detect IF score inversion: if AUC < 0.4, flip scores.
     if_auc = roc_auc_score(y_heuristic, if_pct)
+    if_flipped = False
     log.info("  IF AUC check: %.4f", if_auc)
     if if_auc < 0.4:
         log.warning("  IF scores appear inverted (AUC=%.4f) — flipping!", if_auc)
         if_pct = 100.0 - if_pct
+        if_flipped = True
 
     if xgb_proba is not None:
-        xgb_pct  = rankdata(xgb_proba) / len(xgb_proba) * 100
-        composite = (
-            0.50 * xgb_pct +
-            0.30 * lof_pct +
-            0.15 * if_pct  +
-            0.05 * svm_pct
-        )
-        xgb_flag = (xgb_pct >= 95).astype(int)
+        xgb_pct   = rankdata(xgb_proba) / len(xgb_proba) * 100
+        composite = 0.80 * xgb_pct + 0.20 * if_pct
+        xgb_flag  = (xgb_pct >= 95).astype(int)
     else:
         xgb_pct   = np.zeros(len(if_pct))
-        composite = 0.50 * lof_pct + 0.35 * if_pct + 0.15 * svm_pct
+        composite = if_pct.copy()
         xgb_flag  = np.zeros(len(if_pct), dtype=int)
 
-    if_flag  = (if_pct  >= 95).astype(int)
-    lof_flag = (lof_pct >= 95).astype(int)
-    svm_flag = (svm_pct >= 95).astype(int)
-    vote_count = xgb_flag + lof_flag + if_flag + svm_flag
-    is_anomaly = (vote_count >= 2).astype(int)
+    if_flag    = (if_pct >= 95).astype(int)
+    is_anomaly = (composite >= 85).astype(int)
 
     ensemble_results = pd.DataFrame({
         "playerid":        common_ids,
@@ -429,14 +317,9 @@ def build_ensemble(scores: dict,
         "xgb_proba":       xgb_proba if xgb_proba is not None else np.nan,
         "xgb_pct":         xgb_pct,
         "if_pct":          if_pct,
-        "lof_pct":         lof_pct,
-        "svm_pct":         svm_pct,
-        "vote_count":      vote_count,
         "is_anomaly":      is_anomaly,
         "xgb_flag":        xgb_flag,
         "if_flag":         if_flag,
-        "lof_flag":        lof_flag,
-        "svm_flag":        svm_flag,
         "heuristic_bot":   y_heuristic.reindex(common_ids).values,
     })
 
@@ -446,8 +329,7 @@ def build_ensemble(scores: dict,
     percentile_scores = {
         "xgb_pct":   xgb_pct,
         "if_pct":    if_pct,
-        "lof_pct":   lof_pct,
-        "svm_pct":   svm_pct,
         "composite": composite,
+        "if_flipped": if_flipped,
     }
     return ensemble_results, percentile_scores

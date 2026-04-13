@@ -22,8 +22,8 @@ log = logging.getLogger(__name__)
 def add_time_components(history: pd.DataFrame) -> pd.DataFrame:
     """Add hour, day_of_week, date_only columns derived from date_acquired."""
     history = history.copy()
-    history["hour"]        = history["date_acquired"].dt.hour.astype("int8")
-    history["day_of_week"] = history["date_acquired"].dt.dayofweek.astype("int8")
+    history["hour"]        = history["date_acquired"].dt.hour.astype("Int8")
+    history["day_of_week"] = history["date_acquired"].dt.dayofweek.astype("Int8")
     history["date_only"]   = history["date_acquired"].dt.date
     return history
 
@@ -31,17 +31,15 @@ def add_time_components(history: pd.DataFrame) -> pd.DataFrame:
 def build_player_library(purchased: pd.DataFrame) -> dict:
     """
     Return {playerid (int): set(gameid (int))} for O(1) library membership checks.
-
-    Explicit int conversion prevents type mismatch between library items (may be
-    stored as str in parquet) and reviews.gameid (int) — without this, isin()
-    always returns False, causing review_unowned_ratio = 1.0 for every player.
+    Now handles the structured list of dicts: [{"appid": 10, "playtime_mins": 0}]
     """
     result = {}
     for pid, lib in zip(purchased["playerid"], purchased["library"]):
-        if lib is None:
+        if lib is None or not isinstance(lib, np.ndarray):
             result[int(pid)] = set()
         else:
-            result[int(pid)] = {int(g) for g in lib if g is not None}
+            # lib is an array of dicts
+            result[int(pid)] = {int(item.get('appid')) for item in lib if item and item.get('appid') is not None}
     return result
 
 
@@ -285,6 +283,41 @@ def _diversity_features(history: pd.DataFrame,
          ach_game_ratio, top1_conc, top3_conc, game_hhi, avg_ach_per_game],
         axis=1,
     )
+    
+    
+def _playtime_features(history: pd.DataFrame, purchased: pd.DataFrame) -> pd.DataFrame:
+    """Group F: Playtime and achievement plausibility signals."""
+    
+    # Tính tổng số thành tựu mỗi người chơi
+    total_achievements = history.groupby("playerid").size().rename("total_achievements")
+    
+    def calculate_playtime_stats(lib):
+        if lib is None or not isinstance(lib, np.ndarray):
+            return pd.Series({"total_playtime_mins": np.nan, "games_with_playtime_data": 0})
+        
+        total_mins = 0
+        valid_games = 0
+        for item in lib:
+            if item and item.get('playtime_mins') is not None and item.get('playtime_mins') >= 0:
+                total_mins += item.get('playtime_mins')
+                valid_games += 1
+                
+        if valid_games == 0:
+             return pd.Series({"total_playtime_mins": np.nan, "games_with_playtime_data": 0})
+             
+        return pd.Series({"total_playtime_mins": total_mins, "games_with_playtime_data": valid_games})
+
+    playtime_stats = purchased.set_index("playerid")["library"].apply(calculate_playtime_stats)
+    
+    # Tính thời gian chơi trung bình cho mỗi thành tựu (chỉ tính cho những người có dữ liệu playtime)
+    # Cần handle trường hợp total_achievements = 0
+    df = pd.concat([playtime_stats, total_achievements], axis=1)
+    
+    # Những người có playtime nhưng không có achievement -> NaN (tránh chia cho 0)
+    # Những người có achievement nhưng không có playtime -> NaN
+    df["playtime_per_achievement"] = df["total_playtime_mins"] / df["total_achievements"].replace(0, np.nan)
+
+    return df[["total_playtime_mins", "playtime_per_achievement"]]
 
 
 def _review_features(reviews: pd.DataFrame, player_library: dict) -> pd.DataFrame:
@@ -327,7 +360,11 @@ def _review_features(reviews: pd.DataFrame, player_library: dict) -> pd.DataFram
     )
 
 
-def _account_age_features(history: pd.DataFrame, players: pd.DataFrame) -> pd.DataFrame:
+def _account_age_features(
+    history: pd.DataFrame,
+    players: pd.DataFrame,
+    reference_time: pd.Timestamp | None = None,
+) -> pd.DataFrame:
     """Bonus: account age and time-to-first-achievement."""
     player_created = players.set_index("playerid")["created"]
     first_ach      = history.groupby("playerid")["date_acquired"].min()
@@ -338,8 +375,9 @@ def _account_age_features(history: pd.DataFrame, players: pd.DataFrame) -> pd.Da
         .clip(lower=0)
         .rename("days_before_first_achievement")
     )
+    ref_ts = pd.Timestamp.now() if reference_time is None else pd.Timestamp(reference_time)
     account_age = (
-        (pd.Timestamp.now() - player_created)
+        (ref_ts - player_created)
         .dt.days
         .rename("account_age_days")
     )
@@ -350,7 +388,8 @@ def build_feature_matrix(history: pd.DataFrame,
                           reviews: pd.DataFrame,
                           players: pd.DataFrame,
                           purchased: pd.DataFrame,
-                          player_library: dict) -> pd.DataFrame:
+                          player_library: dict,
+                          reference_time: pd.Timestamp | None = None) -> pd.DataFrame:
     """
     Step 3: Compute all 23 per-player features across 5 groups.
     Players appearing only in reviews (0 achievements) get NaN for
@@ -374,25 +413,21 @@ def build_feature_matrix(history: pd.DataFrame,
 
     log.info("  Group D: review features …")
     grp_d = _review_features(reviews, player_library)
-    # Players with no reviews get 0 for count/rate features.
-    # review_unowned_ratio is intentionally left as NaN for:
-    #   (a) players with no reviews (unknown — not 0, since 0 would mean "all owned")
-    #   (b) players with reviews but absent from purchased_games (no library data)
-    # The SimpleImputer downstream will fill both cases with the median of
-    # players for whom we have valid library data.
     grp_d = grp_d.reindex(all_players).fillna(
         {"total_reviews": 0,
          "review_duplication_rate": 0.0,
          "avg_review_length": 0.0,
          "min_review_length": 0.0}
-        # review_unowned_ratio: leave NaN — handled by imputer
     )
 
-    log.info("  Bonus: account age features …")
-    grp_bonus = _account_age_features(history, players)
+    log.info("  Group E: account age features …") # Sửa lại log info
+    grp_bonus = _account_age_features(history, players, reference_time=reference_time)
+
+    log.info("  Group F: playtime features …")
+    grp_playtime = _playtime_features(history, purchased)
 
     feature_matrix = pd.concat(
-        [grp_a, grp_b, grp_c, grp_d, grp_bonus], axis=1
+        [grp_a, grp_b, grp_c, grp_d, grp_bonus, grp_playtime], axis=1
     ).reindex(all_players)
 
     log.info("  Feature matrix: %d players × %d features",

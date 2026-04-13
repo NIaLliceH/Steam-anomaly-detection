@@ -2,14 +2,14 @@
 Steam Anomaly Detection — Main Pipeline Orchestrator (V2)
 Executes Steps 2–9. Step 1 (data prep) is handled by src/data_prep.py.
 
-V2 pipeline order:
-  2. Heuristic Labels V2    (AND logic, 3 bot archetypes, Bug #3 fix)
-  3. Feature Engineering    (Bug #2 fix: int-safe library lookup)
-  4. Preprocessing          (Imputer + RobustScaler + PCA 90%)
-  5a. Unsupervised tuning   (IF / LOF / OCSVM grid search)
-  5b. XGBoost training      (semi-supervised, RandomizedSearchCV, PRIMARY)
-  6. Final unsupervised     (retrain on full data)
-  7. Ensemble V2            (XGB=0.50, LOF=0.30, IF=0.15+flip-if-inverted, SVM=0.05)
+V3 "Dynamic Duo" pipeline:
+  2. Heuristic Labels V2    (AND logic, 3 bot archetypes)
+  3. Feature Engineering    (int-safe library lookup, NaN for missing library)
+  4. Preprocessing          (Imputer + StandardScaler + PCA 90%)
+  5a. IF tuning             (grid search on IsolationForest only)
+  5b. XGBoost training      (semi-supervised PU Learning, PRIMARY)
+  6. Final IF training      (retrain on full data)
+  7. Ensemble V3            (XGB=0.80, IF=0.20+auto-flip, threshold=85)
   8-9. Evaluation + SHAP    (XGBoost-based SHAP, PR-AUC, feature importance)
 """
 
@@ -21,6 +21,7 @@ import pandas as pd
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "src"))
 
+from active_learning import generate_review_sample, integrate_human_labels
 from features import (
     add_time_components,
     build_feature_matrix,
@@ -46,6 +47,7 @@ log = logging.getLogger(__name__)
 
 PROCESSED_DIR = os.path.join(os.path.dirname(__file__), "data", "processed")
 OUTPUTS_DIR   = os.path.join(os.path.dirname(__file__), "outputs")
+REVIEWED_CSV = os.path.join(os.path.dirname(__file__), "data", "reviewed.csv")
 
 
 # ---------------------------------------------------------------------------
@@ -76,19 +78,28 @@ def main() -> None:
     # ── Load ──────────────────────────────────────────────────────────────────
     history, players, reviews, purchased = load_parquets()
     history = add_time_components(history)
+    feature_reference_time = pd.to_datetime(history["date_acquired"], errors="coerce").max()
+    log.info("Feature reference timestamp (fixed): %s", feature_reference_time)
 
     log.info("Building player library lookup …")
     player_library = build_player_library(purchased)
 
     # ── Step 2: Heuristic Labels V2 ───────────────────────────────────────────
     heuristic_df = build_heuristic_labels(history, reviews, player_library)
+
+    # ── Active Learning: integrate human overrides (if reviewed.csv exists) ───
+    # reviewed_csv = os.path.join(OUTPUTS_DIR, "reviewed.csv")
+    reviewed_csv = os.path.join(REVIEWED_CSV)  # Use reviewed.csv from data/ (updated by auto_label.py)
+    heuristic_df = integrate_human_labels(heuristic_df, reviewed_csv)
+
     heuristic_path = os.path.join(OUTPUTS_DIR, "heuristic_labels.csv")
     heuristic_df.to_csv(heuristic_path)
     log.info("Saved → %s", heuristic_path)
 
     # ── Step 3: Feature Engineering ──────────────────────────────────────────
     feature_matrix = build_feature_matrix(
-        history, reviews, players, purchased, player_library
+        history, reviews, players, purchased, player_library,
+        reference_time=feature_reference_time,
     )
     fm_path = os.path.join(OUTPUTS_DIR, "feature_matrix.csv")
     feature_matrix.to_csv(fm_path)
@@ -125,13 +136,23 @@ def main() -> None:
         X_log, save_path=os.path.join(OUTPUTS_DIR, "preprocessor.pkl")
     )
 
-    # ── Step 5a: Hyperparameter Tuning (unsupervised) ─────────────────────────
-    best_if_params, best_lof_params, best_svm_params, tuning_results = tune_models(
-        X_scaled, y_heuristic
-    )
+    # ── Step 5a: Hyperparameter Tuning (IsolationForest) ─────────────────────
+    best_if_params, tuning_results = tune_models(X_scaled, y_heuristic)
     tuning_path = os.path.join(OUTPUTS_DIR, "tuning_results.csv")
     tuning_results.to_csv(tuning_path, index=False)
     log.info("Saved → %s", tuning_path)
+
+    # Train and save IsolationForest model
+    import joblib
+    best_if_model = None
+    try:
+        from sklearn.ensemble import IsolationForest
+        best_if_model = IsolationForest(**best_if_params)
+        best_if_model.fit(X_scaled)
+        joblib.dump(best_if_model, os.path.join(OUTPUTS_DIR, "best_if.pkl"))
+        log.info("Saved → %s", os.path.join(OUTPUTS_DIR, "best_if.pkl"))
+    except Exception as e:
+        log.error(f"Could not save best_if.pkl: {e}")
 
     # ── Step 5b: XGBoost (PRIMARY model) ─────────────────────────────────────
     best_xgb, xgb_proba, _ = train_xgboost_semisupervised(
@@ -139,9 +160,7 @@ def main() -> None:
     )
 
     # ── Step 6: Train Final Unsupervised Models ───────────────────────────────
-    _, scores = train_best_models(
-        X_scaled, best_if_params, best_lof_params, best_svm_params
-    )
+    _, scores = train_best_models(X_scaled, best_if_params)
 
     # ── Step 7: Ensemble V2 ───────────────────────────────────────────────────
     ensemble_results, percentile_scores = build_ensemble(
@@ -150,6 +169,9 @@ def main() -> None:
     ensemble_path = os.path.join(OUTPUTS_DIR, "ensemble_results.csv")
     ensemble_results.to_csv(ensemble_path, index=False)
     log.info("Saved → %s", ensemble_path)
+
+    # ── Active Learning: export high-conflict cases for human review ──────────
+    generate_review_sample(ensemble_results, feature_matrix.loc[common_ids], OUTPUTS_DIR)
 
     # ── Steps 8 & 9: Evaluate + SHAP ──────────────────────────────────────────
     evaluate(
@@ -165,6 +187,27 @@ def main() -> None:
         outputs_dir            = OUTPUTS_DIR,
     )
 
+    # --- Save model memory for Streamlit app ---
+    import joblib
+    from datetime import datetime
+    model_memory = {
+        "feature_columns": original_feature_names,
+        "baseline_size": int(len(common_ids)),
+        "trained_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "feature_reference_time": None if pd.isna(feature_reference_time) else pd.Timestamp(feature_reference_time).isoformat(),
+        "sorted_raw_scores": {
+            "IsolationForest": list(sorted(scores["IsolationForest"])) if "IsolationForest" in scores else [],
+            "XGBoost": list(sorted(xgb_proba)) if xgb_proba is not None else [],
+        },
+        "raw_scores": {
+            "IsolationForest": list(scores["IsolationForest"]) if "IsolationForest" in scores else [],
+            "XGBoost": list(xgb_proba) if xgb_proba is not None else [],
+        },
+        "if_flipped": bool(percentile_scores.get("if_flipped", False)),
+    }
+    joblib.dump(model_memory, os.path.join(OUTPUTS_DIR, "model_memory.pkl"))
+    log.info("Saved → %s", os.path.join(OUTPUTS_DIR, "model_memory.pkl"))
+    
     log.info("Pipeline complete. All outputs in %s/", OUTPUTS_DIR)
 
 
