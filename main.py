@@ -9,7 +9,7 @@ V3 "Dynamic Duo" pipeline:
   5a. IF tuning             (grid search on IsolationForest only)
   5b. XGBoost training      (semi-supervised PU Learning, PRIMARY)
   6. Final IF training      (retrain on full data)
-  7. Ensemble V3            (XGB=0.80, IF=0.20+auto-flip, threshold=85)
+  7. Ensemble V3            (XGB=0.70, IF=0.30+auto-flip, threshold=85)
   8-9. Evaluation + SHAP    (XGBoost-based SHAP, PR-AUC, feature importance)
 """
 
@@ -27,6 +27,7 @@ from features import (
     build_feature_matrix,
     build_heuristic_labels,
     build_player_library,
+    build_zero_playtime_library,
 )
 from models import (
     apply_log_transform,
@@ -34,6 +35,7 @@ from models import (
     preprocess,
     train_best_models,
     train_xgboost_semisupervised,
+    tune_ensemble_weights,
     tune_models,
 )
 from evaluate import evaluate
@@ -82,10 +84,15 @@ def main() -> None:
     log.info("Feature reference timestamp (fixed): %s", feature_reference_time)
 
     log.info("Building player library lookup …")
-    player_library = build_player_library(purchased)
+    player_library        = build_player_library(purchased)
+    zero_playtime_library = build_zero_playtime_library(purchased)
 
     # ── Step 2: Heuristic Labels V2 ───────────────────────────────────────────
-    heuristic_df = build_heuristic_labels(history, reviews, player_library)
+    heuristic_df = build_heuristic_labels(
+        history, reviews,
+        zero_playtime_library=zero_playtime_library,
+        players=players,
+    )
 
     # ── Active Learning: integrate human overrides (if reviewed.csv exists) ───
     # reviewed_csv = os.path.join(OUTPUTS_DIR, "reviewed.csv")
@@ -127,12 +134,12 @@ def main() -> None:
     original_feature_names = X_raw.columns.tolist()
     log.info("Common players for modelling: %d", len(common_ids))
 
-    # Log-transform heavy-tailed features before entering the sklearn pipeline.
-    # Without this, std_unlock_interval_sec (reaches millions) causes PCA to
-    # collapse: PC1 absorbs >92% of variance, leaving LOF/OCSVM with 1D data.
+    # Log-transform heavy-tailed features before scaling.
+    # std_unlock_interval_sec and similar span millions — log1p compresses them
+    # to approximately log-normal so StandardScaler z-scores remain meaningful.
     X_log = apply_log_transform(X_raw)
 
-    X_scaled, preprocessor, pca_feature_names = preprocess(
+    X_scaled, preprocessor, feature_names = preprocess(
         X_log, save_path=os.path.join(OUTPUTS_DIR, "preprocessor.pkl")
     )
 
@@ -170,6 +177,14 @@ def main() -> None:
     ensemble_results.to_csv(ensemble_path, index=False)
     log.info("Saved → %s", ensemble_path)
 
+    # ── Step 7b: Ensemble Weight Tuning ──────────────────────────────────────
+    tune_ensemble_weights(
+        xgb_pct     = percentile_scores["xgb_pct"],
+        if_pct      = percentile_scores["if_pct"],
+        y_heuristic = y_heuristic,
+        outputs_dir = OUTPUTS_DIR,
+    )
+
     # ── Active Learning: export high-conflict cases for human review ──────────
     generate_review_sample(ensemble_results, feature_matrix.loc[common_ids], OUTPUTS_DIR)
 
@@ -179,7 +194,7 @@ def main() -> None:
         percentile_scores      = percentile_scores,
         y_heuristic            = y_heuristic,
         feature_matrix         = feature_matrix.loc[common_ids],
-        feature_names          = pca_feature_names,   # PCA components for SHAP
+        feature_names          = feature_names,        # original feature names for SHAP
         X_scaled               = X_scaled,
         best_xgb               = best_xgb,
         xgb_proba              = xgb_proba,

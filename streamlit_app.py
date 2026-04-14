@@ -613,7 +613,7 @@ def infer_online_profiles_batch(feature_profiles: list[dict], bundle: dict) -> l
         if_pct = 100.0 - if_pct
     xgb_pct = _percentile_from_sorted(xgb_sorted, xgb_proba)
 
-    composite = 0.80 * xgb_pct + 0.20 * if_pct
+    composite = 0.70 * xgb_pct + 0.30 * if_pct
 
     xgb_flag = (xgb_pct >= 95).astype(int)
     if_flag = (if_pct >= 95).astype(int)

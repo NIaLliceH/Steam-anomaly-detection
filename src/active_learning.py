@@ -49,7 +49,7 @@ def generate_review_sample(
     Parameters
     ----------
     ensemble_results : DataFrame returned by build_ensemble()
-    feature_matrix   : raw feature DataFrame (pre-PCA), indexed by playerid
+    feature_matrix   : raw feature DataFrame, indexed by playerid
     outputs_dir      : path to the outputs directory
     top_k            : maximum number of rows to export (sorted by composite_score desc)
 
