@@ -95,8 +95,8 @@ def main() -> None:
     heuristic_df = build_heuristic_labels(feature_matrix)
 
     # ── Active Learning: integrate human overrides (if reviewed.csv exists) ───
-    reviewed_csv = os.path.join(REVIEWED_CSV)  # updated by auto_label.py
-    heuristic_df = integrate_human_labels(heuristic_df, reviewed_csv)
+    # reviewed_csv = os.path.join(REVIEWED_CSV)  # updated by auto_label.py
+    # heuristic_df = integrate_human_labels(heuristic_df, reviewed_csv)
 
     heuristic_path = os.path.join(OUTPUTS_DIR, "heuristic_labels.csv")
     heuristic_df.to_csv(heuristic_path)
@@ -160,7 +160,7 @@ def main() -> None:
     )
 
     # ── Active Learning: export high-conflict cases for human review ──────────
-    generate_review_sample(ensemble_results, feature_matrix.loc[common_ids], OUTPUTS_DIR)
+    # generate_review_sample(ensemble_results, feature_matrix.loc[common_ids], OUTPUTS_DIR)
 
     # ── Steps 8 & 9: Evaluate + SHAP ──────────────────────────────────────────
     evaluate(
