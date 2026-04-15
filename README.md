@@ -12,9 +12,9 @@ Steam là nền tảng game lớn nhất thế giới với hàng triệu tài k
 
 | Loại Bot | Đặc trưng |
 |---------|----------|
-| **Speed Bot** | Unlock thành tích <1s, 85%+ tập trung 1 game |
-| **Volume Bot** | >500 thành tích/ngày, >40% hoạt động ban đêm (00:00–06:00), tổng >1000 achievements |
-| **Review Bot** | >5 reviews cho game chưa từng sở hữu (thư viện trống) |
+| **Speed Bot** | median unlock interval < 10s, 85%+ achievements tập trung 1 game |
+| **Volume Bot** | >500 achievements/ngày + >40% hoạt động ban đêm + tổng >1000; hoặc >90% achievements trên game chưa chạy (SAM unlocker) |
+| **Review Bot** | >5 reviews, 0 achievements, >50% review cho game chưa chơi, >50% nội dung trùng lặp |
 
 **Thách thức chính:**
 - Không có ground truth labels (bots không tự nhận)
@@ -45,155 +45,143 @@ Xây dựng hệ thống phát hiện anomalies với:
 **Xử lý chính:**
 1. Lọc private accounts (227k IDs)
 2. Parse timestamp, extract gameid từ achievementid string via regex
-3. Parse library JSON thành list of dicts (N:1 relationship)
+3. Parse library JSON thành list of dicts (appid + playtime_mins)
 4. Dedup, type-optimize, export to Parquet
 
 **Output:** `data/processed/{history,players,reviews,purchased}.parquet`
 
 ### 2.2 EDA & Feature Engineering (Step 2-3)
 
-**Heuristic Labels V2 (pseudo ground truth)**
+**Heuristic Labels (pseudo ground truth)**
 
-Sử dụng AND logic (không OR) để giảm false positives — chỉ flag những tài khoản có dấu hiệu rõ ràng:
+Sử dụng AND logic để giảm false positives — chỉ flag những tài khoản có dấu hiệu rõ ràng:
 
-| Loại Bot | Điều kiện AND |
-|---------|---------------|
-| Speed Bot | median_interval < 10s AND min_interval < 1s AND top1_concentration > 85% |
-| Volume Bot | max_per_day > 500 AND night_ratio > 40% AND ach_count > 1000 |
-| Review Bot | review_count > 5 AND ach_count == 0 AND unowned_ratio > 70% |
-| Normal | ach_count > 10 AND median_interval > 1800s (đầo vào PU Learning) |
+| Loại Bot | Điều kiện |
+|---------|-----------|
+| **Speed Bot** | median_interval < 10s AND top1_concentration > 85% |
+| **Volume Bot** | (max_per_day > 500 AND night_ratio > 40% AND ach_count > 1000) OR zero_playtime_ratio > 90% |
+| **Review Bot** | review_count > 5 AND ach_count == 0 AND unplayed_ratio > 50% AND dup_rate > 50% |
+| **Normal** | ach_count > 10 AND median_interval > 600s (đầu vào PU Learning) |
 
-**27 Features được tính**
+**25 Features được tính** (`build_feature_matrix` trong `features.py`)
 
 Chia thành 6 nhóm để phát hiện các chiều bất thường:
 
-| Nhóm | Số features | Ý nghĩa |
-|-----|----------|---------|
-| **Speed** | 6 | Tốc độ unlock: median, min, std của time_interval, CV, max/day, max/min |
-| **Temporal** | 4 | Mô hình thời gian: night_ratio, hour_entropy, activity_density, weekend_ratio |
-| **Diversity** | 8 | Phân tán game: total_ach, games_w_ach, library_size, ach_ratio, concentration (top1/top3/HHI), avg_ach/game |
-| **Review** | 5 | Review behavior: total, unowned_ratio*, duplication_rate, avg/min_length |
+| Nhóm | Số features | Features |
+|-----|-------------|---------|
+| **Speed** | 5 | median/std unlock interval, CV, max/day, max/min |
+| **Temporal** | 3 | night_activity_ratio, hour_entropy, activity_density |
+| **Diversity** | 7 | total_ach, library_size, ach_game_ratio, top1/top3_concentration, game_hhi, avg_ach/game |
+| **Review** | 5 | total_reviews, unplayed_ratio, duplication_rate, avg/min_length |
 | **Account Age** | 2 | days_before_first_ach, account_age_days |
-| **Playtime** | 2 | total_playtime_mins*, playtime_per_achievement* |
+| **Playtime** | 3 | zero_playtime_ratio, total_playtime_mins, playtime_per_achievement |
 
-*NaN nếu không có purchased data → impute bằng median
-
-**Data Trimming:** Loại ghost accounts — chỉ giữ những players với ach_count ≥ 10 AND library_size ≥ 1 → ~196k → ~40-60k accounts
+**Data Trimming:** Thực hiện một lần duy nhất bên trong `build_feature_matrix` — giữ players với **(ach_count ≥ 10 OR review_count ≥ 3) AND library_size ≥ 1** → 196,703 → 22,583 active accounts (loại 174,120 ghost accounts)
 
 ---
 
 ## 3. Approach & Model Architecture
 
-### 3.1 Các cách tiếp cận được nghiên cứu
+### 3.1 Lựa chọn kiến trúc
 
-Quá trình development qua 3 iteration:
+Kiến trúc hiện tại là **XGBoost (primary) + IsolationForest (secondary)**. Các lựa chọn thay thế bị loại vì:
 
-| Iteration | Ensemble | Kết quả | Vấn đề |
-|-----------|----------|--------|--------|
-| **V1** | IF + LOF + OCSVM (voting) | ROC-AUC = 0.13 | IF bị invert (0.0052), LOF/OCSVM O(N²) bottleneck |
-| **V2** | IF + XGBoost (supervised) | ROC-AUC = 0.62 | Heuristic labels quá nhiễu (OR logic), library parsing bug |
-| **V3 (hiện tại)** | XGBoost (PU Learning) + IF auto-flip | ROC-AUC = 0.78–0.85 | Model ổn định, interpretable |
-
-**Lý do loại bỏ:**
-- **LOF**: O(N²) complexity → timeout với 40k players
-- **OCSVM**: Low weight (0.20) + sparse feature space → weak signal
+- **LOF / OCSVM**: O(N²) complexity → không scale được với 22k players; OCSVM thêm cho sparse feature space → weak signal
+- **PCA**: Thay thế tên feature thực bằng anonymous PC components → phá vỡ SHAP explainability; đồng thời nén các anomaly signals hiếm (bot archetypes chiếm <2%) vào các components bị loại, làm giảm recall
+- **Supervised XGBoost thuần**: Không có ground truth labels → không thể train trực tiếp; PU Learning (chỉ train trên confident subset) là giải pháp phù hợp nhất cho bài toán weak-label này
 
 ### 3.2 Dynamic Duo Architecture (V3)
 
 ```
-┌─────────────────────────────────┐
-│ Preprocessing                   │
-│ - log1p(heavy_tail_cols)        │
-│ - Impute NaN with median        │
-│ - StandardScaler                │
-│ - PCA (90% variance → 8-12 PC)  │
-└──────────────┬──────────────────┘
-               │
-        ┌──────┴──────┐
-        ↓             ↓
-   PRIMARY        SECONDARY
-   ┌────────────────────┐
-   │ XGBoost            │ IsolationForest
-   │ PU Learning Filter │ Auto-flip if ROC<0.4
-   │ (heur_bot=1 OR     │ (Statistical outlier)
-   │  heur_normal=1)    │
-   │ scale_pos_weight   │
-   │ RandomizedSearch   │
-   │ (n_iter=50, cv=5)  │
-   │ PR-AUC scoring     │
-   └────────────────────┘
-        ↓             ↓
-   Percentile Ranking (0-100)
-        ↓             ↓
-    XGB_pct ← IF_pct
-        │         │
-        └────┬────┘
-             ↓
-   Weighted Composite
-   composite = 0.80×XGB_pct + 0.20×IF_pct
-        ↓
-   is_anomaly = (composite ≥ 85) ? 1 : 0
+Raw Features (25)
+       │
+       ├──────────────────────────┐
+       │ Path A — IsolationForest │ Path B — XGBoost
+       │ log1p (heavy-tail cols)  │ X_raw trực tiếp
+       │ SimpleImputer (median)   │ (NaN = tín hiệu thực)
+       │ StandardScaler           │
+       ↓                          ↓
+  IsolationForest            XGBoost PU Learning
+  (unsupervised)             (confident subset only:
+                              heur_bot=1 OR heur_normal=1)
+                              scale_pos_weight
+                              RandomizedSearch (n_iter=50, cv=5)
+                              PR-AUC scoring
+       ↓                          ↓
+  Percentile Ranking (0–100)
+       ↓                          ↓
+   if_pct                     xgb_pct
+       └──────────┬────────────────┘
+                  ↓
+      Weighted Composite
+      composite = 0.70×xgb_pct + 0.30×if_pct
+                  ↓
+      is_anomaly = (composite ≥ 85) ? 1 : 0
 ```
 
 **Tại sao PU Learning cho XGBoost?**
 
-SOS class imbalance (heur_bot:heur_normal ≈ 5:95%+) → chỉ train trên confirmed labels
+Class imbalance (heur_bot:heur_normal ≈ 5:95%+) → chỉ train trên confirmed labels:
 - Loại grey area (không có label hoặc conflicting signals)
-- scale_pos_weight tự động cân bằng positive/negative trong training set
-- Tăng cảm nhạy detect bots thực mà vẫn giữ specificity
+- `scale_pos_weight` tự động cân bằng positive/negative trong training set
+- Tăng sensitivity detect bots thực mà vẫn giữ specificity
 
 **Tại sao percentile rank ensemble?**
 
-Raw scores từ XGBoost (0–1) vs IsolationForest (-∞ to 0) không so sánh được → đưa về [0, 100] percentile rank:
-- Mỗi model được công bằng xem xét
+Raw scores từ XGBoost (0–1) vs IsolationForest (âm, path-length based) không so sánh được → đưa về [0, 100] percentile rank:
+- Mỗi model được xem xét công bằng
 - Threshold (≥85) dễ hiểu: top 15% "most suspicious"
-- IF auto-flip: nếu ROC-AUC < 0.4 → đảo hướng (inversion detection)
 
 ### 3.3 Preprocessing Pipeline (Step 4)
 
-**Tại sao log1p transform?**
+**Split paths — lý do tách riêng:**
 
-`std_unlock_interval_sec` có range 1s → 10 triệu giây (=116 ngày). PCA collapse nếu không transform:
-- Trước: PC1 giải thích >92% variance → model chạy trên dữ liệu gần 1D
-- Sau log1p: Phân phối đối xứng, 8-12 PC giải thích 90% variance → multi-dimensional anomaly detection
+| | Path A (IsolationForest) | Path B (XGBoost) |
+|--|--------------------------|-----------------|
+| Transform | log1p(clip(x, 0)) cho 9 heavy-tail features | Không |
+| Impute | SimpleImputer(median) | Không — NaN xử lý natively |
+| Scale | StandardScaler | Không — invariant với monotonic transform |
+
+**Tại sao log1p (chỉ cho IF)?**
+
+`std_unlock_interval_sec` có range 1s → 10 triệu giây (116 ngày). IsolationForest dùng uniform random split trên [min, max] của mỗi feature: khi feature trải dài nhiều bậc độ lớn, hầu hết split điểm rơi vào vùng sparse high-value tail, khiến path length không phản ánh mật độ dữ liệu thực. log1p cân bằng lại distribution, ổn định path-length comparison.
 
 **Tại sao StandardScaler không RobustScaler?**
 
-Ghost accounts (0 ach) chiếm ~75% → IQR ≈ 0 → RobustScaler scale active players lên giá trị cực lớn:
-- Trước: Ghost ≈ 0, Active ≈ 1000+ → feature space bị collapse
-- Sau: Tất cả → z-score normalize → balanced representation
+Sau trimming chỉ còn active players → IQR có ý nghĩa → StandardScaler cho z-score normalize cân bằng.
 
 ### 3.4 Phương pháp đánh giá
 
 **Metrics chính:**
-- **ROC-AUC**: Measure discrimination across thresholds vs heuristic_bot labels
+- **ROC-AUC**: Discrimination across thresholds vs heuristic_bot labels
 - **PR-AUC**: Precision-Recall curve (tốt hơn ROC với imbalanced data)
-- **Precision@K**: % bots trong top-K flagged accounts (K=100, 500, 1000)
-  - Đánh giá "nếu review top-100 flagged, bao nhiêu %là bot thực?"
-- **SHAP Feature Importance**: Cách các feature đóng góp vào prediction
+- **Precision@K**: % bots trong top-K flagged accounts (K=100, 500, 1000) — "nếu review top-100, bao nhiêu % là bot thực?"
+- **SHAP Feature Importance**: Contribution của từng feature vào prediction (trên X_raw — giữ thang đo gốc, dễ đọc)
 
 **Validation set:**
 - Heuristic labels (pseudo ground truth) → không phải true labels
-- Known limitation: target leakage (features overlap heuristic rules)
-  - Metrics đo "model bắt chước heuristic rules" → upper bound trên real performance
+- Known limitation: target leakage (features overlap heuristic rules) → metrics = upper bound trên real performance
 
 ### 3.5 Kết quả (Main.py outputs)
 
-| Output | Nôi dung |
+| Output | Nội dung |
 |--------|----------|
-| **ensemble_results.csv** | playerid, composite_score (0-100), is_anomaly, xgb_proba, xgb_pct, if_pct, heuristic_bot |
-| **feature_matrix.csv** | 27 raw features cho all players |
-| **model_comparison.csv** | ROC-AUC, PR-AUC, Precision@K cho XGBoost, IF, Ensemble |
-| **top50_flagged_profiles.csv** | Top-50 highest composite_score + feature stats so với normal users |
-| **plots/shap_*.png** | SHAP summary, waterfall, scatter plots (XGBoost explanations) |
+| **ensemble_results.csv** | playerid, composite_score (0–100), is_anomaly, xgb_proba, xgb_pct, if_pct, heuristic_bot |
+| **feature_matrix.csv** | 25 raw features cho all players |
+| **heuristic_labels.csv** | heuristic_bot, heuristic_normal (sau HITL override) |
+| **model_comparison.csv** | ROC-AUC, PR-AUC, Flagged Rate%, Precision@K cho XGBoost, IF, Ensemble |
+| **ensemble_weight_metrics.csv** | Precision@100, PR-AUC, HCC theo từng xgb_weight từ 0→1 |
+| **top50_flagged_profiles.csv** | Mean features: top-50 flagged vs normal users |
+| **plots/shap_*.png** | SHAP summary, waterfall, scatter plots (XGBoost, trên X_raw) |
 | **best_xgb.pkl** | Trained XGBoost model |
-| **preprocessor.pkl** | Pipeline (Imputer + StandardScaler + PCA) |
+| **best_if.pkl** | Trained IsolationForest model |
+| **preprocessor.pkl** | Pipeline (SimpleImputer + StandardScaler) dùng cho IF path |
 
 **Một số kết quả ví dụ:**
 - XGBoost ROC-AUC: 0.78–0.85 (tùy tuning)
-- IF ROC-AUC: 0.45–0.55 (trước auto-flip)
+- IF ROC-AUC: 0.45–0.55
 - Ensemble ROC-AUC: 0.75–0.82
-- Anomaly rate: ~2-5% của active accounts được flag
+- Anomaly rate: ~2–5% của active accounts được flag
 
 ---
 
@@ -209,7 +197,7 @@ streamlit run streamlit_app.py
 
 **Tính năng:**
 - Input Steam ID → Xem composite score, is_anomaly prediction, model confidence
-- Feature visualization: So sánh 27 features của player với baseline (normal users)
+- Feature visualization: So sánh 25 features của player với baseline (normal users)
 - Model decision breakdown: Percentile rank từ XGB vs IF
 - Behavioral evidence: Giải thích tại sao account bị flag (speed, reviews, etc.)
 - Baseline comparison: Cohen's d effect size vs normal users
@@ -231,7 +219,7 @@ python3 run_testcase_evaluation.py \
 ```
 
 **Testcase format:**
-- playerid, human_label (0=normal, 1=bot), + 27 feature columns
+- playerid, human_label (0=normal, 1=bot), + 25 feature columns
 - Model inference + confusion matrix, classification report
 - Output: predictions.csv, behavior_analysis.csv, summary.txt
 
@@ -261,8 +249,8 @@ python3 batch_analysis.py --query-only --steam-ids ID1 ID2 ...
 ### Chạy từng bước
 
 ```bash
-python3 src/data_prep.py       # Phase 1: ETL + Parquet
-python3 main.py                # Phase 2: ML pipeline
+python3 src/data_prep.py        # Phase 1: ETL + Parquet
+python3 main.py                 # Phase 2: ML pipeline
 streamlit run streamlit_app.py  # Dashboard UI
 ```
 
@@ -283,20 +271,13 @@ python3 merge_crawled_purchased_games.py
 
 ## Dependencies
 
-```
-pandas, numpy, scikit-learn, scipy, xgboost, shap, matplotlib, joblib, pyarrow
-streamlit (dashboard), requests (crawling)
-```
-
-Cài: `pip install -r requirements.txt`
+`pip install -r requirements.txt`
 
 ---
 
 ## Known Limitations
 
-1. **Target leakage**: Heuristic labels tính từ features dùng để train → metrics = "model mimics heuristics"
+1. **Target leakage**: Heuristic labels tính từ features dùng để train → metrics = "model mimics heuristics", không phải true performance
 2. **Không có ground truth**: Chỉ dùng heuristic labels (weak labels)
-3. **Data coverage**: ~75% players thiếu purchased_games → features bị impute
-4. **Ghost accounts**: ~75% trong 196k bị loại → chỉ ~40-60k active accounts được model
-
-
+3. **Data coverage**: Một phần players thiếu purchased_games → `review_unplayed_ratio` và playtime features bị NaN (XGBoost xử lý natively; IF path impute bằng median)
+4. **Ghost accounts**: ~75% trong 196k bị loại bởi trimming → 22,583 active accounts được model
