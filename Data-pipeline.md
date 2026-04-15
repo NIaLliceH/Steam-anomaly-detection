@@ -102,7 +102,7 @@ Output: `data/processed/*.parquet` (history, players, reviews, purchased)
 
 - **Speed bot**: `median_unlock_interval_sec < 10s` AND `top1_game_concentration > 0.85`
 - **Volume bot**: (`max_per_day > 500` AND `night_activity_ratio > 0.40` AND `total_achievements > 1000`) OR `zero_playtime_achievements_ratio > 0.9` (SAM catch-all)
-- **Review bot**: `total_reviews > 5` AND `total_achievements == 0` AND `review_unplayed_ratio > 0.50` AND `review_duplication_rate > 0.50`
+- **Review bot**: `total_reviews > 5` AND `total_achievements == 0` AND `review_unplayed_ratio > 0.50` AND `review_duplication_rate > 0.50` AND `avg_rev_len` < 50
 - `heuristic_bot` = speed_bot | volume_bot | review_bot
 - `heuristic_normal` → `total_achievements > 10` AND `median_unlock_interval_sec > 600s` (10 min, dùng cho PU Learning)
 
