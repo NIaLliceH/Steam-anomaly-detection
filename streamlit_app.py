@@ -460,9 +460,29 @@ def show_plot_if_exists(path: str, caption: str, *, width: int | None = None) ->
     else:
         st.info(f"File not found: {path}")
 
+
+def _safe_mtime(path: str) -> float | None:
+    if not os.path.exists(path):
+        return None
+    return os.path.getmtime(path)
+
+
+def get_model_bundle_cache_key() -> tuple[float | None, ...]:
+    return (
+        _safe_mtime("outputs/model_memory.pkl"),
+        _safe_mtime("outputs/preprocessor.pkl"),
+        _safe_mtime("outputs/best_if.pkl"),
+        _safe_mtime("outputs/best_xgb.pkl"),
+    )
+
+
+def get_feature_matrix_cache_key() -> float | None:
+    return _safe_mtime("outputs/feature_matrix.csv")
+
+
 @st.cache_resource(show_spinner=False)
 # Load the saved models, preprocessor, and calibration memory from disk.
-def load_model_bundle() -> dict | None:
+def load_model_bundle(_cache_key: tuple[float | None, ...]) -> dict | None:
     memory_path = "outputs/model_memory.pkl"
     preprocessor_path = "outputs/preprocessor.pkl"
     model_paths = {
@@ -485,7 +505,7 @@ def load_model_bundle() -> dict | None:
 
 
 @st.cache_resource(show_spinner=False)
-def load_feature_matrix_lookup() -> pd.DataFrame | None:
+def load_feature_matrix_lookup(_cache_key: float | None) -> pd.DataFrame | None:
     """Load feature_matrix indexed by playerid for exact train-online parity."""
     path = "outputs/feature_matrix.csv"
     if not os.path.exists(path):
@@ -536,6 +556,44 @@ def _parse_library_cell(cell) -> set[int]:
         return library_ids
     except Exception:
         return set()
+
+
+def _parse_library_stats(cell) -> tuple[set[int], float, int]:
+    """Parse app IDs plus aggregate playtime from a purchased-games library cell."""
+    if pd.isna(cell):
+        return set(), np.nan, 0
+
+    text = str(cell).strip()
+    if not text:
+        return set(), np.nan, 0
+
+    try:
+        values = json.loads(text.replace("'", '"'))
+    except Exception:
+        return set(), np.nan, 0
+
+    library_ids: set[int] = set()
+    total_playtime_mins = 0
+    games_with_playtime = 0
+
+    for item in values:
+        if isinstance(item, dict):
+            appid = item.get("appid")
+            if pd.notna(appid):
+                library_ids.add(int(appid))
+
+            playtime = item.get("playtime_mins")
+            if playtime is not None and pd.notna(playtime):
+                playtime_int = int(playtime)
+                if playtime_int >= 0:
+                    total_playtime_mins += playtime_int
+                    games_with_playtime += 1
+        elif str(item).strip():
+            library_ids.add(int(item))
+
+    if games_with_playtime == 0:
+        return library_ids, np.nan, 0
+    return library_ids, float(total_playtime_mins), games_with_playtime
 
 # Collect crawled data files into a single lookup bundle for scoring.
 def load_crawled_data() -> dict[str, pd.DataFrame | None]:
@@ -635,6 +693,41 @@ def infer_online_profiles_batch(feature_profiles: list[dict], bundle: dict) -> l
         )
     return results
 
+
+def export_online_metrics_csv(
+    feature_profiles: list[dict],
+    bundle: dict,
+) -> tuple[Path, pd.DataFrame, list[str]]:
+    """Export online feature rows using the exact trained feature column order."""
+    feature_columns = [str(c) for c in bundle.get("memory", {}).get("feature_columns", [])]
+    if not feature_columns:
+        raise ValueError("model_memory.pkl does not contain feature_columns")
+
+    export_df = pd.DataFrame(feature_profiles).copy()
+    if export_df.empty:
+        raise ValueError("No online feature profiles available to export")
+
+    ordered_cols = ["playerid", *feature_columns]
+    for col in ordered_cols:
+        if col not in export_df.columns:
+            export_df[col] = np.nan
+
+    export_df = export_df[ordered_cols]
+    export_df["playerid"] = export_df["playerid"].astype("Int64").astype(str)
+
+    out_dir = Path("outputs")
+    out_dir.mkdir(parents=True, exist_ok=True)
+    out_path = out_dir / "online_27_metrics.csv"
+    try:
+        export_df.to_csv(out_path, index=False, encoding="utf-8-sig")
+    except PermissionError:
+        base = "online_27_metrics"
+        suffix = ".csv"
+        fallback_name = pd.Timestamp.now().strftime(f"{base}_%Y%m%d_%H%M%S{suffix}")
+        out_path = out_dir / fallback_name
+        export_df.to_csv(out_path, index=False, encoding="utf-8-sig")
+    return out_path, export_df, feature_columns
+
 # Rebuild a temporary profile from crawl tables for one Steam ID.
 def compute_temp_profile(
     pid: int,
@@ -642,7 +735,7 @@ def compute_temp_profile(
     model_memory: dict | None = None,
 ) -> dict:
     # For IDs present in training feature matrix, use the exact same row as training.
-    fm_lookup = load_feature_matrix_lookup()
+    fm_lookup = load_feature_matrix_lookup(get_feature_matrix_cache_key())
     if fm_lookup is not None and pid in fm_lookup.index:
         row = fm_lookup.loc[pid].to_dict()
         row["playerid"] = int(pid)
@@ -659,73 +752,100 @@ def compute_temp_profile(
         p = players_c.copy()
         p["playerid"] = pd.to_numeric(p["playerid"], errors="coerce")
         p = p[p["playerid"] == pid]
+        p = p.drop_duplicates(subset=["playerid"], keep="last")
         if not p.empty:
             row["country"] = p.iloc[-1].get("country", np.nan)
             row["created"] = p.iloc[-1].get("created", np.nan)
 
     library = set()
+    total_playtime_mins = np.nan
     if purchased_c is not None and "playerid" in purchased_c.columns:
         pu = purchased_c.copy()
         pu["playerid"] = pd.to_numeric(pu["playerid"], errors="coerce")
         pu = pu[pu["playerid"] == pid]
+        pu = pu.drop_duplicates(subset=["playerid"], keep="last")
         if not pu.empty and "library" in pu.columns:
-            library = _parse_library_cell(pu.iloc[-1]["library"])
+            library, total_playtime_mins, _ = _parse_library_stats(pu.iloc[-1]["library"])
     row["library_size"] = len(library)
+    row["total_playtime_mins"] = total_playtime_mins
 
     h = pd.DataFrame()
+    h_timed = pd.DataFrame()
     if history_c is not None and "playerid" in history_c.columns:
         h = history_c.copy()
         h["playerid"] = pd.to_numeric(h["playerid"], errors="coerce")
         h = h[h["playerid"] == pid].copy()
 
     if not h.empty:
-        if "date_acquired" not in h.columns and "date_accquired" in h.columns:
-            h["date_acquired"] = h["date_accquired"]
-        h["date_acquired"] = pd.to_datetime(h.get("date_acquired"), errors="coerce")
-        h = h.dropna(subset=["date_acquired"]).copy()
-        h = h.sort_values("date_acquired")
+        if "date_accquired" in h.columns:
+            if "date_acquired" in h.columns:
+                h["date_acquired"] = h["date_acquired"].fillna(h["date_accquired"])
+            else:
+                h["date_acquired"] = h["date_accquired"]
+        h["date_acquired"] = pd.to_datetime(
+            h.get("date_acquired"),
+            format="%Y-%m-%d %H:%M:%S",
+            errors="coerce",
+        )
 
         if "gameid" not in h.columns and "achievementid" in h.columns:
             h["gameid"] = h["achievementid"].astype(str).str.extract(r"^(\d+)_")[0]
         h["gameid"] = pd.to_numeric(h.get("gameid"), errors="coerce")
+        dedupe_cols = [c for c in ["playerid", "achievementid", "date_acquired"] if c in h.columns]
+        if dedupe_cols:
+            h = h.drop_duplicates(subset=dedupe_cols, keep="last")
+        else:
+            h = h.drop_duplicates()
+
+        h = h.sort_values("date_acquired")
+        h_timed = h.dropna(subset=["date_acquired"]).copy()
 
         row["total_achievements"] = float(len(h))
         row["games_with_achievements"] = float(h["gameid"].nunique())
+
+        if pd.notna(row.get("total_playtime_mins", np.nan)):
+            if row["total_achievements"] > 0:
+                row["playtime_per_achievement"] = row["total_playtime_mins"] / row["total_achievements"]
+            else:
+                row["playtime_per_achievement"] = np.nan
 
         if row["library_size"] > 0:
             row["achievement_game_ratio"] = row["games_with_achievements"] / row["library_size"]
         else:
             row["achievement_game_ratio"] = np.nan
 
-        h["minute"] = h["date_acquired"].dt.floor("min")
-        h["day"] = h["date_acquired"].dt.floor("D")
-        row["max_achievements_per_minute"] = float(h.groupby("minute").size().max())
-        row["max_achievements_per_day"] = float(h.groupby("day").size().max())
-
         h["hour"] = h["date_acquired"].dt.hour
         h["dow"] = h["date_acquired"].dt.dayofweek
         row["night_activity_ratio"] = float((h["hour"] < 6).mean())
         row["weekend_ratio"] = float(h["dow"].isin([5, 6]).mean())
 
-        hour_counts = h["hour"].value_counts(normalize=True)
-        probs = hour_counts.values
-        row["hour_entropy"] = float(-np.sum(probs * np.log(probs + 1e-12)))
+        if not h_timed.empty:
+            h_timed["minute"] = h_timed["date_acquired"].dt.floor("min")
+            h_timed["day"] = h_timed["date_acquired"].dt.floor("D")
+            h_timed["hour"] = h_timed["date_acquired"].dt.hour
+            h_timed["dow"] = h_timed["date_acquired"].dt.dayofweek
+            row["max_achievements_per_minute"] = float(h_timed.groupby("minute").size().max())
+            row["max_achievements_per_day"] = float(h_timed.groupby("day").size().max())
 
-        active_days = h["day"].nunique()
-        span_days = (h["date_acquired"].max() - h["date_acquired"].min()).days + 1
-        row["activity_density"] = float(active_days / span_days) if span_days > 0 else np.nan
+            hour_counts = h_timed["hour"].value_counts(normalize=True)
+            probs = hour_counts.values
+            row["hour_entropy"] = float(-np.sum(probs * np.log(probs + 1e-12)))
 
-        h["interval_sec"] = h["date_acquired"].diff().dt.total_seconds()
-        iv = h["interval_sec"].dropna()
-        row["median_unlock_interval_sec"] = float(iv.median()) if not iv.empty else np.nan
-        row["min_unlock_interval_sec"] = float(iv.min()) if not iv.empty else np.nan
-        row["std_unlock_interval_sec"] = float(iv.std()) if not iv.empty else np.nan
-        iv_mean = float(iv.mean()) if not iv.empty else np.nan
-        row["cv_unlock_interval"] = (
-            float(row["std_unlock_interval_sec"] / iv_mean)
-            if not np.isnan(iv_mean) and iv_mean > 0 and not np.isnan(row["std_unlock_interval_sec"])
-            else np.nan
-        )
+            active_days = h_timed["day"].nunique()
+            span_days = (h_timed["date_acquired"].max() - h_timed["date_acquired"].min()).days + 1
+            row["activity_density"] = float(active_days / span_days) if span_days > 0 else np.nan
+
+            h_timed["interval_sec"] = h_timed["date_acquired"].diff().dt.total_seconds()
+            iv = h_timed["interval_sec"].dropna()
+            row["median_unlock_interval_sec"] = float(iv.median()) if not iv.empty else np.nan
+            row["min_unlock_interval_sec"] = float(iv.min()) if not iv.empty else np.nan
+            row["std_unlock_interval_sec"] = float(iv.std()) if not iv.empty else np.nan
+            iv_mean = float(iv.mean()) if not iv.empty else np.nan
+            row["cv_unlock_interval"] = (
+                float(row["std_unlock_interval_sec"] / iv_mean)
+                if not np.isnan(iv_mean) and iv_mean > 0 and not np.isnan(row["std_unlock_interval_sec"])
+                else np.nan
+            )
 
         gcounts = h["gameid"].value_counts()
         if not gcounts.empty:
@@ -741,6 +861,10 @@ def compute_temp_profile(
         r = reviews_c.copy()
         r["playerid"] = pd.to_numeric(r["playerid"], errors="coerce")
         r = r[r["playerid"] == pid].copy()
+        if "reviewid" in r.columns:
+            r = r.drop_duplicates(subset=["reviewid"], keep="last")
+        else:
+            r = r.drop_duplicates()
 
     row["total_reviews"] = float(len(r))
     if not r.empty and "review" in r.columns:
@@ -749,6 +873,10 @@ def compute_temp_profile(
         row["min_review_length"] = float(text_col.str.len().min())
         unique_n = text_col.nunique(dropna=True)
         row["review_duplication_rate"] = float(1 - (unique_n / len(text_col))) if len(text_col) > 0 else np.nan
+    else:
+        row["review_duplication_rate"] = 0.0
+        row["avg_review_length"] = 0.0
+        row["min_review_length"] = 0.0
 
     if not r.empty and "gameid" in r.columns and row["library_size"] > 0:
         rg = pd.to_numeric(r["gameid"], errors="coerce").dropna().astype("int64")
@@ -764,8 +892,8 @@ def compute_temp_profile(
         ref_time = pd.Timestamp.now()
     if pd.notna(created_dt):
         row["account_age_days"] = float((ref_time - created_dt).days)
-        if not h.empty:
-            row["days_before_first_achievement"] = float((h["date_acquired"].min() - created_dt).days)
+        if not h_timed.empty:
+            row["days_before_first_achievement"] = float((h_timed["date_acquired"].min() - created_dt).days)
 
     return row
 
@@ -932,7 +1060,7 @@ st.divider()
 st.header("2) Real-time Steam Crawl (Online Inference)")
 st.write("")
 
-bundle = load_model_bundle()
+bundle = load_model_bundle(get_model_bundle_cache_key())
 if bundle is None:
     st.error("Saved model memory not found. Please run python3 batch_analysis.py first to generate outputs/model_memory.pkl and associated model artifacts.")
     st.stop()
@@ -1083,6 +1211,24 @@ with c2:
                 if not feature_profiles:
                     st.warning("No eligible profiles available for inference.")
                 else:
+                    try:
+                        online_metric_path, online_metric_df, online_feature_cols = export_online_metrics_csv(
+                            feature_profiles,
+                            bundle,
+                        )
+                        st.caption(
+                            f"Saved online metrics export: {online_metric_path} "
+                            f"({len(online_metric_df):,} IDs x {len(online_feature_cols)} metrics)"
+                        )
+                        st.download_button(
+                            "Download online 27 metrics (CSV)",
+                            data=online_metric_df.to_csv(index=False).encode("utf-8-sig"),
+                            file_name=online_metric_path.name,
+                            mime="text/csv",
+                        )
+                    except Exception as exc:
+                        st.warning(f"Could not export online 27-metric files: {exc}")
+
                     try:
                         analyzed_batch = infer_online_profiles_batch(feature_profiles, bundle)
                     except Exception as exc:

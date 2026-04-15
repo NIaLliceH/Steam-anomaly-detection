@@ -51,10 +51,10 @@ def run_ml_pipeline():
     """Automatically call Machine Learning scripts"""
     print("\n=== 2. RUNNING AI PIPELINE (Please wait...) ===")
     print("[*] Running Phase 1 (Data Prep)...")
-    subprocess.run(["python3", "src/data_prep.py"], check=True)
+    subprocess.run(["python", "src/data_prep.py"], check=True)
     
     print("[*] Running Phase 2 (Anomaly Detection Model)...")
-    subprocess.run(["python3", "main.py"], check=True)
+    subprocess.run(["python", "main.py"], check=True)
 
 def _load_known_playerids():
     """
@@ -505,10 +505,10 @@ if __name__ == "__main__":
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
-  python3 batch_analysis.py                           # Full pipeline (if new data exists)
-  python3 batch_analysis.py --query-only              # Skip injection, query existing results only
-  python3 batch_analysis.py --query-only --steam-ids 123 456  # Query specific player IDs
-  python3 batch_analysis.py --force-run               # Force run pipeline even without new data
+  python batch_analysis.py                           # Full pipeline (if new data exists)
+  python batch_analysis.py --query-only              # Skip injection, query existing results only
+  python batch_analysis.py --query-only --steam-ids 123 456  # Query specific player IDs
+  python batch_analysis.py --force-run               # Force run pipeline even without new data
         """
     )
     
@@ -555,10 +555,10 @@ Examples:
         if data_injected or args.force_run:
             print("\n=== 2. RUNNING AI PIPELINE (Please wait...) ===")
             print("[*] Running Phase 1 (Data Prep)...")
-            subprocess.run(["python3", "src/data_prep.py"], check=True)
+            subprocess.run(["python", "src/data_prep.py"], check=True)
             
             print("[*] Running Phase 2 (Anomaly Detection Model)...")
-            subprocess.run(["python3", "main.py"], check=True)
+            subprocess.run(["python", "main.py"], check=True)
         else:
             print("\n[*] No new data injected. Skipping pipeline and using existing results.")
         

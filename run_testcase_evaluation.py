@@ -1,17 +1,22 @@
-"""Evaluator for a unified testcase CSV.
+"""Standalone evaluator for a unified testcase CSV.
 
-Expected input columns:
+This file requires the trained artifacts already saved in outputs/:
+- model_memory.pkl
+- preprocessor.pkl
+- best_xgb.pkl
+- best_if.pkl
+
+Expected testcase columns:
 - playerid
 - human_label (0/1)
-Optional columns:
-- 27 feature columns
+- the same 27 feature columns stored in model_memory.pkl
 
 Behavior:
-- Uses playerid from testcase as the exact evaluation set (no re-sampling).
-- Runs model inference and computes confusion matrix + metrics.
-- Exports predictions, behavior lines, confusion matrix, and summary.
+- Uses the testcase player set exactly as provided; no re-sampling.
+- Scores testcase rows directly from the 27 feature columns embedded in the CSV.
+- Exports predictions, confusion matrix, and summary files into outputs/.
 
-Use the standardized testcase_40_unified.csv in data/test/ with columns: playerid, human_label, and 27 metric columns.
+Default input: data/test/testcase_40_unified.csv
 """
 
 from __future__ import annotations
@@ -21,20 +26,144 @@ import json
 from pathlib import Path
 import sys
 
+import joblib
 import numpy as np
 import pandas as pd
 
 ROOT = Path(__file__).resolve().parent
-sys.path.insert(0, str(ROOT / "scripts"))
+OUTPUTS_DIR = ROOT / "outputs"
+sys.path.insert(0, str(ROOT / "src"))
 
-from independent_40_test import (
-    OUTPUTS_DIR,
-    bot_evidence_text,
-    confusion_matrix_df,
-    infer_and_score,
-    load_model_bundle,
-    parse_playerid_series,
-)
+
+def parse_playerid_series(series: pd.Series) -> pd.Series:
+    """Parse SteamID values safely from string-like input to int64 without float precision loss."""
+    s = series.astype("string").str.strip()
+    s = s.where(s.notna() & (s != ""))
+    s = s.where(s.str.fullmatch(r"\d+"), other=pd.NA)
+    return pd.to_numeric(s, errors="coerce").astype("Int64")
+
+
+def load_model_bundle() -> dict:
+    """Load the saved model artifacts required for standalone inference."""
+    required = {
+        "memory": OUTPUTS_DIR / "model_memory.pkl",
+        "preprocessor": OUTPUTS_DIR / "preprocessor.pkl",
+        "xgb": OUTPUTS_DIR / "best_xgb.pkl",
+        "iforest": OUTPUTS_DIR / "best_if.pkl",
+    }
+
+    missing = [name for name, path in required.items() if not path.exists()]
+    if missing:
+        raise FileNotFoundError(
+            "Missing model artifacts: " + ", ".join(missing) + ". Run main.py first."
+        )
+
+    return {
+        "memory": joblib.load(required["memory"]),
+        "preprocessor": joblib.load(required["preprocessor"]),
+        "xgb": joblib.load(required["xgb"]),
+        "iforest": joblib.load(required["iforest"]),
+    }
+
+
+def bot_evidence_text(row: pd.Series) -> str:
+    """Return a concise explanation string for why a profile looks bot-like."""
+    reasons: list[str] = []
+
+    median_i = row.get("median_unlock_interval_sec")
+    min_i = row.get("min_unlock_interval_sec")
+    top1 = row.get("top1_game_concentration")
+    max_day = row.get("max_achievements_per_day")
+    night_r = row.get("night_activity_ratio")
+    total_ach = row.get("total_achievements")
+    review_unowned = row.get("review_unowned_ratio")
+    total_reviews = row.get("total_reviews")
+
+    if pd.notna(median_i) and pd.notna(min_i) and pd.notna(top1):
+        if (median_i < 10) and (min_i < 1) and (top1 > 0.85):
+            reasons.append("Speed pattern: unlock interval extremely short + high single-game concentration")
+
+    if pd.notna(max_day) and pd.notna(night_r) and pd.notna(total_ach):
+        if (max_day > 500) and (night_r > 0.40) and (total_ach > 1000):
+            reasons.append("Volume pattern: very high daily unlock volume + night-heavy activity")
+
+    if pd.notna(total_reviews) and pd.notna(total_ach) and pd.notna(review_unowned):
+        if (total_reviews > 5) and (total_ach == 0) and (review_unowned > 0.70):
+            reasons.append("Review pattern: many unowned-game reviews with no achievement history")
+
+    xgb_pct = row.get("xgb_pct")
+    if_pct = row.get("if_pct")
+    comp = row.get("composite_score")
+    if pd.notna(xgb_pct) and pd.notna(if_pct) and pd.notna(comp):
+        reasons.append(f"Model signal: xgb_pct={xgb_pct:.1f}, if_pct={if_pct:.1f}, composite={comp:.1f}")
+
+    if not reasons:
+        return "Weak explicit rule evidence; flagged mainly by model score distribution."
+    return " | ".join(reasons)
+
+
+def percentile_from_sorted(sorted_scores: np.ndarray, values: np.ndarray) -> np.ndarray:
+    """Convert raw scores into percentile ranks against baseline scores."""
+    if sorted_scores.size == 0:
+        return np.full(shape=len(values), fill_value=np.nan, dtype=np.float32)
+    idx = np.searchsorted(sorted_scores, values, side="right")
+    return (idx / sorted_scores.size * 100).astype(np.float32)
+
+
+def infer_and_score(features: pd.DataFrame, bundle: dict) -> pd.DataFrame:
+    """Run preprocessing + models and return per-player predictions."""
+    from models import apply_log_transform
+
+    feature_columns = bundle["memory"].get("feature_columns")
+    if not feature_columns:
+        raise ValueError("model_memory.pkl does not contain feature_columns")
+
+    X = features.reindex(columns=feature_columns)
+    X_log = apply_log_transform(X)
+    X_scaled = bundle["preprocessor"].transform(X_log)
+
+    xgb_model = bundle["xgb"]
+    if_model = bundle["iforest"]
+    memory = bundle["memory"]
+
+    xgb_proba = xgb_model.predict_proba(X_scaled)[:, 1]
+    if_score = -if_model.score_samples(X_scaled)
+
+    xgb_sorted = np.asarray(memory.get("sorted_raw_scores", {}).get("XGBoost", []), dtype=np.float32)
+    if_sorted = np.asarray(memory.get("sorted_raw_scores", {}).get("IsolationForest", []), dtype=np.float32)
+
+    xgb_pct = percentile_from_sorted(xgb_sorted, xgb_proba)
+    if_pct = percentile_from_sorted(if_sorted, if_score)
+    if memory.get("if_flipped", False):
+        if_pct = 100.0 - if_pct
+
+    composite = 0.80 * xgb_pct + 0.20 * if_pct
+    pred = (composite >= 85).astype(int)
+
+    return pd.DataFrame(
+        {
+            "playerid": features.index.astype("int64"),
+            "xgb_proba": xgb_proba,
+            "xgb_pct": xgb_pct,
+            "if_pct": if_pct,
+            "composite_score": composite,
+            "pred_label": pred,
+        }
+    )
+
+
+def confusion_matrix_df(y_true: pd.Series, y_pred: pd.Series) -> pd.DataFrame:
+    """Build a 2x2 confusion matrix with anomaly as positive class."""
+    tp = int(((y_true == 1) & (y_pred == 1)).sum())
+    tn = int(((y_true == 0) & (y_pred == 0)).sum())
+    fp = int(((y_true == 0) & (y_pred == 1)).sum())
+    fn = int(((y_true == 1) & (y_pred == 0)).sum())
+
+    return pd.DataFrame(
+        [[tp, fn], [fp, tn]],
+        index=pd.Index(["Actual Positive", "Actual Negative"], name="actual"),
+        columns=pd.Index(["Predicted Positive", "Predicted Negative"], name="predicted"),
+    )
 
 
 def load_unified_testcase(path: Path) -> pd.DataFrame:
@@ -68,7 +197,7 @@ def load_unified_testcase(path: Path) -> pd.DataFrame:
 
 
 def build_feature_frame_from_testcase(testcase_df: pd.DataFrame, feature_columns: list[str]) -> pd.DataFrame:
-    """Get feature vectors directly from the testcase's 27 metric columns."""
+    """Build the inference frame directly from the testcase's embedded feature columns."""
     if not feature_columns:
         raise ValueError("model_memory.pkl does not contain feature_columns")
 
@@ -87,19 +216,19 @@ def build_feature_frame_from_testcase(testcase_df: pd.DataFrame, feature_columns
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Run testcase evaluation from one unified CSV")
+    parser = argparse.ArgumentParser(description="Run standalone testcase evaluation from one unified CSV")
     parser.add_argument(
         "--testcase-input",
         type=Path,
         default=ROOT / "data" / "test" / "testcase_40_unified.csv",
-        help="Unified testcase CSV with playerid + human_label",
+        help="Unified testcase CSV containing playerid, human_label, and the 27 model features",
     )
-    parser.add_argument("--threshold", type=float, default=85.0, help="Composite-score threshold")
+    parser.add_argument("--threshold", type=float, default=85.0, help="Composite-score threshold used to convert score into pred_label")
     parser.add_argument(
         "--output-prefix",
         type=str,
         default="testcase_eval",
-        help="Prefix for output files in outputs/",
+        help="Prefix for generated output files inside outputs/",
     )
     args = parser.parse_args()
 

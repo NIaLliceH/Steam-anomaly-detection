@@ -122,7 +122,7 @@ def crawl_achievements(steam_id, app_ids):
                 history_records.append({
                     "playerid": steam_id,
                     "achievementid": f"{app_id}_{ach['apiname']}", # Nối appid và apiname
-                    "date_accquired": unix_to_datetime(ach['unlocktime'])
+                    "date_acquired": unix_to_datetime(ach['unlocktime'])
                 })
                 
     return pd.DataFrame(history_records)
@@ -352,7 +352,7 @@ if __name__ == "__main__":
                     print(f"    -> Found {len(df_history)} unlocked achievements!")
                 else:
                     print("    -> No achievements found.")
-                    df_empty = pd.DataFrame(columns=["playerid", "achievementid", "date_accquired"])
+                    df_empty = pd.DataFrame(columns=["playerid", "achievementid", "date_acquired"])
                     save_append(df_empty, "history.csv")
             else:
                 print("[*] Skipping history data (no app IDs available).")
