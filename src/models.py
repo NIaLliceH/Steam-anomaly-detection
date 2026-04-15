@@ -24,6 +24,7 @@ from sklearn.metrics import roc_auc_score
 from sklearn.model_selection import ParameterGrid, RandomizedSearchCV, StratifiedKFold
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import StandardScaler
+import xgboost as xgb
 
 log = logging.getLogger(__name__)
 
@@ -50,15 +51,25 @@ def apply_log_transform(X_raw: pd.DataFrame) -> pd.DataFrame:
 
     **Mathematical justification (thesis reference)**
     Achievement-timing and count features follow power-law (Pareto) distributions:
-    a small number of bots produce astronomically large values (e.g. `std_unlock_interval_sec`
-    spans 6+ orders of magnitude).  The log1p transform — log(1 + x) — compresses
-    these extreme outliers while preserving the relative ordering of values and
-    remaining defined at x = 0.  After transformation the marginal distributions are
-    approximately log-normal, which satisfies the near-symmetry assumption exploited
-    by StandardScaler.  Without this step a single outlier component absorbs >92% of
-    PCA variance ("PCA collapse"), destroying the multi-dimensional structure that
-    both IsolationForest and XGBoost rely on to separate the bot and normal manifolds.
-    clip(lower=0) guards against negative values produced by imputation or rounding.
+    a small number of bots produce astronomically large values (e.g.
+    `std_unlock_interval_sec` spans 6+ orders of magnitude).
+
+    This transform is retained after PCA removal for one concrete reason:
+    IsolationForest stability.  IF builds random trees by repeatedly choosing a
+    feature and a random split point drawn *uniformly* from [min, max].  When a
+    feature spans many orders of magnitude almost all random splits land in the
+    sparse high-value tail, so the algorithm assigns anomalously short path lengths
+    to outliers not because of genuine multi-feature isolation but purely because
+    of skewed marginal density.  log1p compresses the range to roughly log-normal,
+    making the uniform split distribution representative of actual data density and
+    restoring path-length comparisons to their intended meaning.
+
+    XGBoost is tree-based and learns its own thresholds, so it is invariant to
+    any monotonic feature transformation; this step has no effect on XGBoost
+    beyond ensuring consistent preprocessing between fit and predict.
+
+    clip(lower=0) guards against negative values produced by median imputation
+    or floating-point rounding before the pipeline runs.
 
     Must be called on the raw feature DataFrame before both preprocess() and
     preprocessor.transform() (e.g. inside train_xgboost_semisupervised) so
@@ -184,13 +195,6 @@ def train_xgboost_semisupervised(
 
     Returns (best_xgb, xgb_proba_full, common_ids).
     """
-    import os
-    try:
-        import xgboost as xgb
-    except ImportError:
-        log.error("xgboost not installed. Run: pip install xgboost")
-        raise
-
     log.info("Step 5b — XGBoost PU-Learning training …")
 
     common_ids  = X_raw.index.intersection(y_heuristic.index)
@@ -304,35 +308,15 @@ def build_ensemble(scores: dict,
     Percentile-rank each model (0–100, higher = more suspicious).
 
     Weights: XGB=0.70 (primary), IF=0.30 (secondary).
-    IF auto-flip: if ROC-AUC < 0.4, scores are inverted and flipped.
     Anomaly flag: composite_score >= 85 (high-confidence threshold).
     """
     log.info("Step 7 — Building ensemble (Dynamic Duo: XGB + IF) …")
     if_scores = scores["IsolationForest"]
+    # Negate score_samples so higher value = more anomalous (matches XGBoost convention).
     if_pct    = rankdata(if_scores) / len(if_scores) * 100
 
-    # ── Auto-flip: align IsolationForest score direction with XGBoost ────────
-    # sklearn's IsolationForest.score_samples() returns the *raw anomaly score*,
-    # which is negative for anomalies and near-zero/positive for normal data
-    # (a lower score = more anomalous).  We negate it above (`-score_samples`)
-    # so that *higher values signal higher risk*, matching XGBoost's
-    # predict_proba[:,1] convention.
-    #
-    # However, on some data distributions the internal forest depth averaging
-    # can invert this relationship, producing AUC < 0.5 against the heuristic
-    # labels.  An AUC < 0.4 (significantly below random chance) is a reliable
-    # sign that the direction is still wrong after negation.  Subtracting from
-    # 100 (the percentile ceiling) re-inverts the percentile vector, restoring
-    # alignment with the heuristic ground truth and with XGBoost's direction.
-    # The threshold of 0.4 (rather than 0.5) avoids flipping on borderline
-    # models that are merely weak but not actively inverted.
     if_auc = roc_auc_score(y_heuristic, if_pct)
-    if_flipped = False
-    log.info("  IF AUC check: %.4f", if_auc)
-    if if_auc < 0.4:
-        log.warning("  IF scores appear inverted (AUC=%.4f) — flipping!", if_auc)
-        if_pct = 100.0 - if_pct
-        if_flipped = True
+    log.info("  IF ROC-AUC: %.4f", if_auc)
 
     if xgb_proba is not None:
         xgb_pct   = rankdata(xgb_proba) / len(xgb_proba) * 100
@@ -365,7 +349,6 @@ def build_ensemble(scores: dict,
         "xgb_pct":   xgb_pct,
         "if_pct":    if_pct,
         "composite": composite,
-        "if_flipped": if_flipped,
     }
     return ensemble_results, percentile_scores
 

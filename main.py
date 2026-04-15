@@ -16,8 +16,10 @@ V3 "Dynamic Duo" pipeline:
 import logging
 import os
 import sys
-
+import joblib
 import pandas as pd
+from datetime import datetime
+
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "src"))
 
@@ -90,8 +92,8 @@ def main() -> None:
     # ── Step 2: Heuristic Labels V2 ───────────────────────────────────────────
     heuristic_df = build_heuristic_labels(
         history, reviews,
-        zero_playtime_library=zero_playtime_library,
-        players=players,
+        zero_playtime_library,
+        players,
     )
 
     # ── Active Learning: integrate human overrides (if reviewed.csv exists) ───
@@ -105,8 +107,7 @@ def main() -> None:
 
     # ── Step 3: Feature Engineering ──────────────────────────────────────────
     feature_matrix = build_feature_matrix(
-        history, reviews, players, purchased, player_library,
-        reference_time=feature_reference_time,
+        history, reviews, players, purchased, feature_reference_time,
     )
     fm_path = os.path.join(OUTPUTS_DIR, "feature_matrix.csv")
     feature_matrix.to_csv(fm_path)
@@ -135,8 +136,10 @@ def main() -> None:
     log.info("Common players for modelling: %d", len(common_ids))
 
     # Log-transform heavy-tailed features before scaling.
-    # std_unlock_interval_sec and similar span millions — log1p compresses them
-    # to approximately log-normal so StandardScaler z-scores remain meaningful.
+    # Needed for IsolationForest path-length stability: uniform random splits on
+    # a feature spanning 6+ orders of magnitude are unrepresentative of actual
+    # data density.  log1p re-balances the split distribution without affecting
+    # XGBoost, which is invariant to monotonic feature transformations.
     X_log = apply_log_transform(X_raw)
 
     X_scaled, preprocessor, feature_names = preprocess(
@@ -149,25 +152,15 @@ def main() -> None:
     tuning_results.to_csv(tuning_path, index=False)
     log.info("Saved → %s", tuning_path)
 
-    # Train and save IsolationForest model
-    import joblib
-    best_if_model = None
-    try:
-        from sklearn.ensemble import IsolationForest
-        best_if_model = IsolationForest(**best_if_params)
-        best_if_model.fit(X_scaled)
-        joblib.dump(best_if_model, os.path.join(OUTPUTS_DIR, "best_if.pkl"))
-        log.info("Saved → %s", os.path.join(OUTPUTS_DIR, "best_if.pkl"))
-    except Exception as e:
-        log.error(f"Could not save best_if.pkl: {e}")
-
+    # ── Step 6: Train Final IsolationForest ──────────────────────────────────
+    models, scores = train_best_models(X_scaled, best_if_params)
+    joblib.dump(models["IsolationForest"], os.path.join(OUTPUTS_DIR, "best_if.pkl"))
+    log.info("Saved → %s", os.path.join(OUTPUTS_DIR, "best_if.pkl"))
+    
     # ── Step 5b: XGBoost (PRIMARY model) ─────────────────────────────────────
     best_xgb, xgb_proba, _ = train_xgboost_semisupervised(
         X_log, y_heuristic, y_normal, preprocessor, OUTPUTS_DIR
     )
-
-    # ── Step 6: Train Final Unsupervised Models ───────────────────────────────
-    _, scores = train_best_models(X_scaled, best_if_params)
 
     # ── Step 7: Ensemble V2 ───────────────────────────────────────────────────
     ensemble_results, percentile_scores = build_ensemble(
@@ -203,8 +196,6 @@ def main() -> None:
     )
 
     # --- Save model memory for Streamlit app ---
-    import joblib
-    from datetime import datetime
     model_memory = {
         "feature_columns": original_feature_names,
         "baseline_size": int(len(common_ids)),
@@ -218,7 +209,6 @@ def main() -> None:
             "IsolationForest": list(scores["IsolationForest"]) if "IsolationForest" in scores else [],
             "XGBoost": list(xgb_proba) if xgb_proba is not None else [],
         },
-        "if_flipped": bool(percentile_scores.get("if_flipped", False)),
     }
     joblib.dump(model_memory, os.path.join(OUTPUTS_DIR, "model_memory.pkl"))
     log.info("Saved → %s", os.path.join(OUTPUTS_DIR, "model_memory.pkl"))

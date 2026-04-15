@@ -107,8 +107,8 @@ def build_zero_playtime_library(purchased: pd.DataFrame) -> dict:
 
 def build_heuristic_labels(history: pd.DataFrame,
                             reviews: pd.DataFrame,
-                            zero_playtime_library: dict | None = None,
-                            players: pd.DataFrame | None = None) -> pd.DataFrame:
+                            zero_playtime_library: dict,
+                            players: pd.DataFrame) -> pd.DataFrame:
     """
     Create pseudo ground truth (heuristic_bot = 0/1) using 3 AND-rule groups.
 
@@ -116,10 +116,11 @@ def build_heuristic_labels(history: pd.DataFrame,
     - OR logic → AND logic per group to reduce false positives.
       V1's OR rules flagged 98%+ of players; AND rules target only clear bots.
     - 3 distinct bot archetypes: Speed bot, Volume bot, Review bot.
-    - Review bot rule uses review_unplayed_ratio when zero_playtime_library is
-      provided (preferred), or falls back to review_dup_ratio otherwise.
-    - night_ratio is now computed in local time when `players` (with country
-      column) is supplied.  Falls back to UTC if players=None.
+    - Review bot rule requires BOTH review_unplayed_ratio > 0.50 AND
+      review_dup_ratio > 0.50 simultaneously, combining a behavioural signal
+      (reviewing unplayed games) with a textual signal (copy-paste reviews).
+    - night_ratio is computed in local time via per-player UTC offset from
+      _COUNTRY_UTC_OFFSET, using country codes from the players DataFrame.
     """
     log.info("Step 2 — Building heuristic labels …")
 
@@ -147,73 +148,58 @@ def build_heuristic_labels(history: pd.DataFrame,
     )
 
     # ── Night activity ratio (00:00–05:59 local time) ────────────────────────
-    # Apply per-player UTC offset so the window is relative to the player's
-    # local timezone, not the server clock.  Same logic as _temporal_features.
-    if players is not None and "country" in players.columns:
-        offset_map = (
-            players.set_index("playerid")["country"]
-            .astype(str)
-            .map(_COUNTRY_UTC_OFFSET)
-            .fillna(0)
-            .astype(int)
-        )
-        _h = history.copy()
-        _h["local_hour"] = (_h["hour"] + _h["playerid"].map(offset_map).fillna(0).astype(int)) % 24
-        night_counts = _h[_h["local_hour"] < 6].groupby("playerid").size().rename("_night")
-        total_counts = history.groupby("playerid").size().rename("_total")
-        night_ratio  = (night_counts / total_counts).rename("night_ratio").fillna(0)
-        log.info("  night_ratio computed in local time (country-aware UTC offset).")
-    else:
-        night_ratio = (
-            history.assign(is_night=(history["hour"] < 6))
-            .groupby("playerid")["is_night"].mean()
-            .rename("night_ratio")
-        )
-        log.info("  night_ratio computed in UTC (no players data supplied).")
+    # Per-player UTC offset from country code; unknown countries default to 0.
+    offset_map = (
+        players.set_index("playerid")["country"]
+        .astype(str)
+        .map(_COUNTRY_UTC_OFFSET)
+        .fillna(0)
+        .astype(int)
+    )
+    _h = history.copy()
+    _h["local_hour"] = (_h["hour"] + _h["playerid"].map(offset_map).fillna(0).astype(int)) % 24
+    night_counts = _h[_h["local_hour"] < 6].groupby("playerid").size().rename("_night")
+    total_counts = history.groupby("playerid").size().rename("_total")
+    night_ratio  = (night_counts / total_counts).rename("night_ratio").fillna(0)
 
     # ── Achievement and review counts ─────────────────────────────────────────
     ach_counts    = history.groupby("playerid").size().rename("ach_count")
     review_counts = reviews.groupby("playerid").size().rename("review_count")
 
-    # ── Review signal for Group 3 ─────────────────────────────────────────────
-    # Preferred: review_unplayed_ratio — fraction of reviews for games with 0
-    # playtime.  Requires zero_playtime_library to be passed by the caller.
-    # Fallback: review_dup_ratio — copy-paste rate, always computable from text.
-    if zero_playtime_library is not None:
-        def _unplayed(group: pd.DataFrame) -> float:
-            pid = int(group.name)
-            if pid not in zero_playtime_library:
-                return np.nan
-            return group["gameid"].apply(int).isin(zero_playtime_library[pid]).mean()
+    # ── Review signals for Group 3 (both always computed) ────────────────────
+    # Signal A — review_unplayed_ratio: fraction of reviews written for games
+    #   the player owns but has never launched (playtime == 0)
+    def _unplayed(group: pd.DataFrame) -> float:
+        pid = int(group.name)
+        if pid not in zero_playtime_library:
+            return np.nan
+        return group["gameid"].apply(int).isin(zero_playtime_library[pid]).mean()
 
-        review_signal = (
-            reviews.groupby("playerid")
-            .apply(_unplayed, include_groups=False)
-            .rename("_review_signal")
-        )
-        review_signal_threshold = 0.50
-        log.info("  Review bot signal: review_unplayed_ratio (threshold %.2f)",
-                 review_signal_threshold)
-    else:
-        def _dup_rate(s: pd.Series) -> float:
-            cleaned = s.fillna("").str.lower().str.strip()
-            return 0.0 if len(cleaned) <= 1 else 1.0 - (cleaned.nunique() / len(cleaned))
+    unplayed_ratio = (
+        reviews.groupby("playerid")
+        .apply(_unplayed, include_groups=False)
+        .rename("_unplayed_ratio")
+    )
 
-        review_signal = (
-            reviews.groupby("playerid")["review"]
-            .apply(_dup_rate)
-            .rename("_review_signal")
-        )
-        review_signal_threshold = 0.50
-        log.info("  Review bot signal: review_dup_ratio (fallback, threshold %.2f)",
-                 review_signal_threshold)
+    # Signal B — review_dup_ratio: fraction of duplicate/copy-paste reviews.
+    #   Review bots post the same boilerplate text across many titles.
+    def _dup_rate(s: pd.Series) -> float:
+        cleaned = s.fillna("").str.lower().str.strip()
+        return 0.0 if len(cleaned) <= 1 else 1.0 - (cleaned.nunique() / len(cleaned))
+
+    dup_ratio = (
+        reviews.groupby("playerid")["review"]
+        .apply(_dup_rate)
+        .rename("_dup_ratio")
+    )
+
 
     df = pd.concat(
         [median_interval, min_interval, top1_conc, max_per_day,
-         night_ratio, ach_counts, review_counts, review_signal],
+         night_ratio, ach_counts, review_counts, unplayed_ratio, dup_ratio],
         axis=1,
     ).fillna({"review_count": 0, "night_ratio": 0.0, "min_interval": 0.0,
-              "_review_signal": 0.0})
+              "_unplayed_ratio": 0.0, "_dup_ratio": 0.0})
 
     # ── Group 1: SPEED BOT — fast unlock AND concentrated in one game ─────────
     # Real players need ≥ 30s between achievements even in easy games.
@@ -231,11 +217,12 @@ def build_heuristic_labels(history: pd.DataFrame,
         & (df["ach_count"]   > 1000)        # total ≥ 1 000 achievements
     )
 
-    # ── Group 3: REVIEW BOT — zero gameplay + suspicious review pattern ─────────
+    # ── Group 3: REVIEW BOT — zero gameplay + dual review signal ────────────────
     review_bot = (
-        (df["review_count"]    > 5)                          # enough sample
-        & (df["ach_count"]    == 0)                          # never actually played
-        & (df["_review_signal"] > review_signal_threshold)   # unplayed or dup reviews
+        (df["review_count"]     > 5)     # enough sample to be meaningful
+        & (df["ach_count"]     == 0)     # never actually played any game
+        & (df["_unplayed_ratio"] > 0.50) # behavioural: reviews unplayed games
+        & (df["_dup_ratio"]      > 0.30) # textual: copy-paste review content
     )
 
     df["heuristic_bot"] = (speed_bot | volume_bot | review_bot).astype(int)
@@ -402,11 +389,6 @@ def _diversity_features(history: pd.DataFrame,
 def _playtime_features(history: pd.DataFrame, purchased: pd.DataFrame) -> pd.DataFrame:
     """Group F: Playtime plausibility with async-safe achievement cross-referencing.
 
-    Due to asynchronous Steam API crawling, the `history` and `purchased` tables
-    can be captured at different points in time.  Naively treating every game in
-    `history` as "owned" produces false positives.  This function classifies each
-    achievement row into one of three mutually exclusive conditions:
-
     **Condition A — API Lag (excluded from all metrics)**
       Game appears in `history` but is NOT present in the player's `library`.
       Cause: the game was purchased *after* the library snapshot was taken, or
@@ -423,25 +405,6 @@ def _playtime_features(history: pd.DataFrame, purchased: pd.DataFrame) -> pd.Dat
       The achievement was written to the account while the game was never
       launched — the deterministic footprint of Steam Achievement Manager (SAM)
       and similar tools.  Counts toward the denominator but contributes 0 mins.
-
-    Features returned
-    -----------------
-    zero_playtime_achievements_ratio : |C| / (|B| + |C|)
-        Fraction of in-library achievements that were unlocked with 0 playtime.
-        Condition A rows are excluded from the denominator so async lag does not
-        dilute the signal.
-    playtime_per_achievement : Σplaytime_B_games / (|B| + |C|)
-        Average minutes of playtime backing each in-library achievement.
-        Low values combined with a high ratio above are a compound bot signal.
-    total_playtime_mins : Σplaytime_B_games (per player)
-        Sum of playtime over all Condition B games (distinct per player).
-
-    Implementation note
-    -------------------
-    All row-level operations use `.merge()`, boolean indexing, and `.groupby()`
-    on the purchased-library table (~100 K rows after explode) and on the
-    history × library join.  No `.apply()` with custom functions iterates over
-    the 9-million-row history DataFrame.
     """
     # ── Step 1: Explode purchased library → flat (playerid, gameid, playtime_mins)
     # .apply() here is on purchased (~N_players rows), NOT on history (9 M rows).
@@ -520,17 +483,7 @@ def _playtime_features(history: pd.DataFrame, purchased: pd.DataFrame) -> pd.Dat
 
 def _review_features(reviews: pd.DataFrame,
                      zero_playtime_library: dict) -> pd.DataFrame:
-    """Group D: review behaviour signals.
-
-    `review_unowned_ratio` was removed — Steam blocks reviews for unowned games
-    so it mostly flagged private-profile players, not real bots.
-
-    Replaced by `review_unplayed_ratio`: fraction of a player's reviews that
-    are for games they own but have 0 playtime.  Bots typically bulk-review
-    games they've never launched; legitimate reviewers almost always have some
-    playtime.  Players not present in purchased_games receive NaN (the median
-    imputer handles them downstream).
-    """
+    """Group D: review behaviour signals."""
     total_reviews = reviews.groupby("playerid").size().rename("total_reviews")
 
     # Fraction of reviews for games with playtime_mins == 0.
@@ -598,7 +551,6 @@ def build_feature_matrix(history: pd.DataFrame,
                           reviews: pd.DataFrame,
                           players: pd.DataFrame,
                           purchased: pd.DataFrame,
-                          player_library: dict,
                           reference_time: pd.Timestamp | None = None) -> pd.DataFrame:
     """
     Step 3: Compute all per-player features across 6 groups (A–F).

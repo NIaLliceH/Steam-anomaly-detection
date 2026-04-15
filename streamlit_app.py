@@ -600,8 +600,6 @@ def infer_online_profiles_batch(feature_profiles: list[dict], bundle: dict) -> l
 
     models = bundle["models"]
     memory = bundle["memory"]
-    if_flipped = bool(bundle["memory"].get("if_flipped", False))
-
     if_score = -models["IsolationForest"].score_samples(X_new_scaled)
     xgb_proba = models["XGBoost"].predict_proba(X_new_scaled)[:, 1]
 
@@ -609,8 +607,6 @@ def infer_online_profiles_batch(feature_profiles: list[dict], bundle: dict) -> l
     xgb_sorted = _get_sorted_baseline(memory, "XGBoost")
 
     if_pct = _percentile_from_sorted(if_sorted, if_score)
-    if if_flipped:
-        if_pct = 100.0 - if_pct
     xgb_pct = _percentile_from_sorted(xgb_sorted, xgb_proba)
 
     composite = 0.70 * xgb_pct + 0.30 * if_pct
@@ -635,7 +631,6 @@ def infer_online_profiles_batch(feature_profiles: list[dict], bundle: dict) -> l
                 "if_flag": int(if_flag[i]),
                 "baseline_size": int(bundle["memory"].get("baseline_size", 0)),
                 "trained_at": bundle["memory"].get("trained_at"),
-                "if_flipped": if_flipped,
             }
         )
     return results
