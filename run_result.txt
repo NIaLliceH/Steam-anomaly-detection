@@ -1,0 +1,123 @@
+10:18:56 [INFO] Loading processed parquet files from /home/mbelin/hcmut/p4aiNds/btl/data/processed …
+10:19:07 [INFO]   history:   9332162 rows  |  columns: ['playerid', 'achievementid', 'date_acquired', 'date_accquired', 'gameid']
+10:19:07 [INFO]   players:   196726 rows  |  columns: ['playerid', 'country', 'created']
+10:19:07 [INFO]   reviews:   1204622 rows  |  columns: ['reviewid', 'playerid', 'gameid', 'review', 'helpful', 'funny', 'awards', 'posted']
+10:19:07 [INFO]   purchased: 61615 rows  |  columns: ['playerid', 'library', 'library_size']
+10:19:10 [INFO] Feature reference timestamp (last achievement record): 2026-04-02 17:07:55
+10:19:10 [INFO] Step 3 — Building feature matrix …
+10:19:10 [INFO]   Trimming: 196703 total players → 22583 with (≥10 achievements OR ≥3 reviews) AND library_size ≥ 1 (174120 dropped)
+10:19:11 [INFO]   Group A: speed features …
+10:19:18 [INFO]   Group B: temporal features …
+10:19:20 [INFO]   Group C: diversity features …
+10:19:23 [INFO]   Group D: review features …
+10:19:30 [INFO]   Group E: account age features …
+10:19:31 [INFO]   Group F: playtime features …
+10:19:54 [INFO]   Feature matrix: 22583 players × 25 features
+10:19:54 [INFO] Saved → /home/mbelin/hcmut/p4aiNds/btl/outputs/feature_matrix.csv
+10:19:54 [INFO] Step 2 — Building heuristic labels from feature matrix …
+10:19:54 [INFO]   Speed bots:       39
+10:19:54 [INFO]   Volume bots:      417
+10:19:54 [INFO]   Review bots:      7
+10:19:54 [INFO]   Heuristic bots   (total unique): 452 (2.00%)
+10:19:54 [INFO]   Heuristic normal (total unique): 2253 (9.98%)
+10:19:54 [INFO] Saved → /home/mbelin/hcmut/p4aiNds/btl/outputs/heuristic_labels.csv
+10:19:54 [INFO] Common players for modelling: 22583
+10:19:54 [INFO]   Applying log1p to 9 heavy-tailed features: ['total_reviews', 'max_achievements_per_day', 'std_unlock_interval_sec', 'median_unlock_interval_sec', 'total_achievements', 'max_achievements_per_minute', 'avg_achievements_per_game', 'library_size', 'avg_review_length']
+10:19:54 [INFO] Step 4 — Preprocessing (Imputer + StandardScaler) …
+10:19:54 [INFO]   Scaled: 22583 players × 25 features
+10:19:54 [INFO]   Preprocessor saved → /home/mbelin/hcmut/p4aiNds/btl/outputs/preprocessor.pkl
+10:19:54 [INFO] Step 5 — Hyperparameter tuning (IsolationForest) …
+10:19:54 [INFO]   Tuning IsolationForest (54 param combos) …
+10:20:34 [INFO]     Best IF  ROC-AUC=0.9882  {'contamination': 0.02, 'max_features': 1.0, 'max_samples': 0.6, 'n_estimators': 100, 'random_state': 42}
+10:20:34 [INFO] Saved → /home/mbelin/hcmut/p4aiNds/btl/outputs/tuning_results.csv
+10:20:34 [INFO] Step 6 — Training IsolationForest …
+10:20:34 [INFO] Saved → /home/mbelin/hcmut/p4aiNds/btl/outputs/best_if.pkl
+10:20:34 [INFO] Step 5b — XGBoost PU-Learning training (raw features, no scaling) …
+10:20:34 [INFO]   Full set: 22583 players
+10:20:34 [INFO]   PU training set: 2515 players (bot=452, confirmed_normal=2063)
+10:20:34 [INFO]   Grey area excluded: 20068 players
+10:20:34 [INFO]   Class imbalance ratio (scale_pos_weight): 4.56
+10:20:34 [INFO]   Running RandomizedSearchCV (n_iter=50, cv=5) …
+Fitting 5 folds for each of 50 candidates, totalling 250 fits
+10:20:43 [INFO]   Best CV PR-AUC: 1.0000
+10:20:43 [INFO]   Best params: {'subsample': 0.7, 'reg_lambda': 5, 'reg_alpha': 0, 'n_estimators': 200, 'min_child_weight': 1, 'max_depth': 5, 'learning_rate': 0.05, 'colsample_bytree': 0.7}
+10:20:43 [INFO] Step 7 — Building ensemble (Dynamic Duo: XGB + IF) …
+10:20:43 [INFO]   IF ROC-AUC: 0.9882
+10:20:43 [INFO]   Anomalies flagged: 1741 (7.71%)
+10:20:43 [INFO] Saved → /home/mbelin/hcmut/p4aiNds/btl/outputs/ensemble_results.csv
+10:20:43 [INFO] Ensemble weight tuning — sweeping xgb_weight 0.0 → 1.0 (step=0.05) …
+10:20:43 [INFO]   Optimal XGB weight: 0.65  (Precision@100=1.0000, HCC=1333)
+10:20:43 [INFO]   Saved metric table → /home/mbelin/hcmut/p4aiNds/btl/outputs/ensemble_weight_metrics.csv
+10:20:44 [INFO]   Saved dual-axis chart → /home/mbelin/hcmut/p4aiNds/btl/outputs/plots/ensemble_weight_tuning.png
+10:20:44 [INFO] Step 8 — Evaluation & Model Comparison …
+10:20:44 [INFO] 
+                 ROC-AUC  PR-AUC  Flagged Rate %  Precision@100  Precision@500  Precision@1000
+XGBoost           0.9050  0.7252          5.0525           1.00          0.602           0.324
+IsolationForest   0.9882  0.5334          5.0038           0.64          0.524           0.405
+Ensemble          0.9414  0.8354          7.7093           1.00          0.768           0.405
+10:20:44 [INFO]   Optimal threshold (F1): 0.9982
+10:20:44 [INFO] --- XGBoost Detailed Classification Report ---
+10:20:44 [INFO] 
+              precision    recall  f1-score   support
+
+      Normal       0.99      1.00      1.00     22131
+         Bot       0.91      0.66      0.76       452
+
+    accuracy                           0.99     22583
+   macro avg       0.95      0.83      0.88     22583
+weighted avg       0.99      0.99      0.99     22583
+
+10:20:44 [INFO] 
+Top-15 XGBoost Feature Importance:
+                         feature  importance
+        playtime_per_achievement    0.407511
+      median_unlock_interval_sec    0.139121
+           review_unplayed_ratio    0.127565
+zero_playtime_achievements_ratio    0.071863
+        max_achievements_per_day    0.056453
+     max_achievements_per_minute    0.039641
+             total_playtime_mins    0.024526
+              cv_unlock_interval    0.019890
+              total_achievements    0.013664
+       avg_achievements_per_game    0.013387
+          achievement_game_ratio    0.012928
+                    hour_entropy    0.012521
+                account_age_days    0.010483
+                        game_hhi    0.009283
+                   total_reviews    0.006595
+10:20:44 [INFO] 
+Top-50 Flagged vs Normal:
+                                  Flagged (mean)  Normal (mean)   Ratio
+median_unlock_interval_sec                 4.320      13571.321   0.000
+std_unlock_interval_sec               906351.467    2987077.829   0.303
+cv_unlock_interval                        22.597          6.544   3.453
+max_achievements_per_minute             1977.920        290.548   6.808
+max_achievements_per_day                4772.600        805.080   5.928
+night_activity_ratio                       0.303          0.294   1.030
+hour_entropy                               1.565          2.518   0.621
+activity_density                           0.138          0.093   1.493
+total_achievements                     10996.320       2825.665   3.892
+library_size                             281.100        457.772   0.614
+achievement_game_ratio                     0.529          0.388   1.363
+top1_game_concentration                    0.484          0.257   1.882
+top3_game_concentration                    0.686          0.445   1.543
+game_hhi                                   0.356          0.152   2.349
+avg_achievements_per_game                173.872         31.096   5.592
+total_reviews                             14.220         14.543   0.978
+review_unplayed_ratio                      0.861          0.036  23.616
+review_duplication_rate                    0.016          0.022   0.736
+avg_review_length                         92.113        202.596   0.455
+min_review_length                         15.160         30.595   0.496
+days_before_first_achievement            401.000        412.241   0.973
+account_age_days                        3446.857       4196.388   0.821
+zero_playtime_achievements_ratio           0.965          0.083  11.563
+playtime_per_achievement                   8.324        696.482   0.012
+total_playtime_mins                   404504.000     335439.521   1.206
+10:20:44 [INFO] Step 9 — SHAP explanations …
+10:20:44 [INFO]   Computing SHAP values natively via XGBoost on 5000 samples …
+10:20:44 [INFO]   [v] Successfully computed SHAP values via native XGBoost
+10:20:45 [INFO]   Saved shap_summary.png
+10:20:45 [INFO]   Saved shap_waterfall.png
+10:20:45 [INFO]   Saved SHAP scatter plots for: ['median_unlock_interval_sec', 'max_achievements_per_day', 'playtime_per_achievement']
+10:20:46 [INFO] Saved → /home/mbelin/hcmut/p4aiNds/btl/outputs/model_memory.pkl
+10:20:46 [INFO] Pipeline complete. All outputs in /home/mbelin/hcmut/p4aiNds/btl/outputs/

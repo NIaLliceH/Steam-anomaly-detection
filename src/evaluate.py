@@ -74,15 +74,14 @@ def _model_comparison(y_heuristic: pd.Series,
 # XGBoost-specific evaluation
 # ---------------------------------------------------------------------------
 
-def _evaluate_xgboost(best_xgb, X_scaled: np.ndarray,
+def _evaluate_xgboost(best_xgb, X_raw: pd.DataFrame,
                        y_heuristic: pd.Series,
                        original_feature_names: list,
                        plots_dir: str) -> None:
     """PR-AUC, optimal threshold, feature importance, and PR curve plot."""
-    xgb_proba = best_xgb.predict_proba(X_scaled)[:, 1]
+    xgb_proba = best_xgb.predict_proba(X_raw)[:, 1]
 
     pr_auc = average_precision_score(y_heuristic, xgb_proba)
-    log.info("  XGBoost PR-AUC: %.4f", pr_auc)
 
     precisions, recalls, thresholds = precision_recall_curve(y_heuristic, xgb_proba)
     f1_scores = 2 * precisions * recalls / (precisions + recalls + 1e-8)
@@ -91,6 +90,7 @@ def _evaluate_xgboost(best_xgb, X_scaled: np.ndarray,
     log.info("  Optimal threshold (F1): %.4f", best_thresh)
 
     y_pred = (xgb_proba >= best_thresh).astype(int)
+    log.info("--- XGBoost Detailed Classification Report ---")
     log.info("\n%s", classification_report(y_heuristic, y_pred,
                                            target_names=["Normal", "Bot"]))
 
@@ -110,84 +110,78 @@ def _evaluate_xgboost(best_xgb, X_scaled: np.ndarray,
     # Feature importance plot (XGBoost built-in)
     importances = best_xgb.feature_importances_
     
-    # Only create feature importance plot if dimensions match (no PCA applied or PCA not used)
-    if len(importances) == len(original_feature_names):
-        fi_df = pd.DataFrame({
-            "feature":    original_feature_names,
-            "importance": importances,
-        }).sort_values("importance", ascending=False)
+    # PCA removed — importances always align 1-to-1 with original_feature_names.
+    fi_df = pd.DataFrame({
+        "feature":    original_feature_names,
+        "importance": importances,
+    }).sort_values("importance", ascending=False)
 
-        log.info("\nTop-15 XGBoost Feature Importance:\n%s",
-                 fi_df.head(15).to_string(index=False))
+    log.info("\nTop-15 XGBoost Feature Importance:\n%s",
+             fi_df.head(15).to_string(index=False))
 
-        fig, ax = plt.subplots(figsize=(10, 8))
-        fi_df.head(15).plot.barh(x="feature", y="importance", ax=ax)
-        ax.set_title("XGBoost Feature Importance (Top 15)")
-        ax.invert_yaxis()
-        plt.tight_layout()
-        plt.savefig(os.path.join(plots_dir, "xgb_feature_importance.png"), dpi=150)
-        plt.close()
-    else:
-        log.info("  Skipping feature importance plot (PCA reduced features from %d to %d)",
-                 len(original_feature_names), len(importances))
+    fig, ax = plt.subplots(figsize=(10, 8))
+    fi_df.head(15).plot.barh(x="feature", y="importance", ax=ax)
+    ax.set_title("XGBoost Feature Importance (Top 15)")
+    ax.invert_yaxis()
+    plt.tight_layout()
+    plt.savefig(os.path.join(plots_dir, "xgb_feature_importance.png"), dpi=150)
+    plt.close()
 
 
 # ---------------------------------------------------------------------------
 # Step 9 — SHAP (XGBoost — TreeExplainer)
 # ---------------------------------------------------------------------------
 
-def _shap_plots(best_xgb, X_scaled: np.ndarray, feature_names: list,
+def _shap_plots(best_xgb, X_raw: pd.DataFrame, feature_names: list,
                 composite: np.ndarray, plots_dir: str) -> None:
     """
     SHAP summary, waterfall, and per-feature scatter for XGBoost.
-    Sử dụng Native XGBoost SHAP computation để bypass lỗi TreeExplainer parser [5E-1].
+
+    X_raw is the unscaled, unimputed feature DataFrame fed directly to XGBoost
+    (Task 4 split-path).  Using raw features here keeps SHAP values on the
+    original scale, making axis labels and magnitudes directly interpretable
+    (e.g. median_unlock_interval_sec in seconds, not z-scores).
+
+    Uses native XGBoost pred_contribs to bypass TreeExplainer parser issues.
     """
     import xgboost as xgb
-    
+
     SHAP_SAMPLE = 5_000
     rng = np.random.default_rng(42)
-    shap_idx = rng.choice(len(X_scaled), min(SHAP_SAMPLE, len(X_scaled)), replace=False)
-    X_shap = X_scaled[shap_idx]
+    shap_idx = rng.choice(len(X_raw), min(SHAP_SAMPLE, len(X_raw)), replace=False)
+    # iloc preserves the DataFrame type and its column names
+    X_shap = X_raw.iloc[shap_idx]
 
     log.info("  Computing SHAP values natively via XGBoost on %d samples …", len(X_shap))
-    
+
     try:
-        # ========================================================================
-        # BYPASS TREE EXPLAINER: Dùng XGBoost để tự tính SHAP values
-        # ========================================================================
         booster = best_xgb.get_booster()
+        # X_shap is a DataFrame — XGBoost DMatrix reads column names automatically.
         dmatrix = xgb.DMatrix(X_shap, feature_names=feature_names)
-        
-        # pred_contribs=True trả về ma trận (n_samples, n_features + 1)
-        # Các cột đầu là SHAP values của từng feature, cột cuối cùng là expected_value (base_score)
+
+        # pred_contribs returns (n_samples, n_features + 1):
+        # columns 0..n-1 are SHAP values, last column is the base score.
         contribs = booster.predict(dmatrix, pred_contribs=True)
-        
-        shap_values = contribs[:, :-1]
+        shap_values   = contribs[:, :-1]
         expected_value = contribs[0, -1]
-        
+
         log.info("  [v] Successfully computed SHAP values via native XGBoost")
-        # ========================================================================
 
         # Plot 1: Global feature importance (bar/dot summary)
         fig, _ = plt.subplots(figsize=(10, 8))
-        shap.summary_plot(
-            shap_values,
-            pd.DataFrame(X_shap, columns=feature_names),
-            show=False,
-        )
+        shap.summary_plot(shap_values, X_shap, show=False)
         plt.tight_layout()
         plt.savefig(os.path.join(plots_dir, "shap_summary.png"), dpi=150)
         plt.close()
         log.info("  Saved shap_summary.png")
 
-        # Plot 2: Waterfall cho account khả nghi nhất trong mẫu SHAP
+        # Plot 2: Waterfall for the most suspicious account in the SHAP sample
         top1_in_sample = int(np.argmax(composite[shap_idx]))
-        
         shap.waterfall_plot(
             shap.Explanation(
                 values=shap_values[top1_in_sample],
                 base_values=expected_value,
-                data=X_shap[top1_in_sample],
+                data=X_shap.iloc[top1_in_sample].values,
                 feature_names=feature_names,
             ),
             show=False,
@@ -199,16 +193,16 @@ def _shap_plots(best_xgb, X_scaled: np.ndarray, feature_names: list,
         plt.close()
         log.info("  Saved shap_waterfall.png")
 
-        # Plot 3: SHAP scatter cho top-3 features quan trọng nhất
+        # Plot 3: SHAP scatter for top-3 most important features
         importances = np.abs(shap_values).mean(0)
-        top3_idx = np.argsort(importances)[::-1][:3]
-        top3_names = []
-        
+        top3_idx    = np.argsort(importances)[::-1][:3]
+        top3_names  = []
+
         for fi in top3_idx:
             feat = feature_names[fi]
             top3_names.append(feat)
             fig, ax = plt.subplots(figsize=(8, 5))
-            ax.scatter(X_shap[:, fi], shap_values[:, fi], alpha=0.3, s=5)
+            ax.scatter(X_shap.iloc[:, fi].values, shap_values[:, fi], alpha=0.3, s=5)
             ax.set_xlabel(feat)
             ax.set_ylabel("SHAP value")
             ax.set_title(f"SHAP scatter: {feat}")
@@ -216,7 +210,7 @@ def _shap_plots(best_xgb, X_scaled: np.ndarray, feature_names: list,
             safe = feat.replace("/", "_").replace(" ", "_")
             plt.savefig(os.path.join(plots_dir, f"shap_scatter_{safe}.png"), dpi=150)
             plt.close()
-            
+
         log.info("  Saved SHAP scatter plots for: %s", top3_names)
 
     except Exception as e:
@@ -232,7 +226,7 @@ def evaluate(ensemble_results: pd.DataFrame,
              y_heuristic: pd.Series,
              feature_matrix: pd.DataFrame,
              feature_names: list,
-             X_scaled: np.ndarray,
+             X_raw: pd.DataFrame,
              best_xgb,
              xgb_proba: np.ndarray | None,
              original_feature_names: list,
@@ -244,8 +238,11 @@ def evaluate(ensemble_results: pd.DataFrame,
     ----------
     best_xgb              : Trained XGBClassifier (used for SHAP + PR curve).
     xgb_proba             : XGBoost predicted probabilities on the common_ids set.
-    original_feature_names: Raw feature column names (before PCA) for XGB importance.
-    feature_names         : PCA component names (PC1, PC2, …) for SHAP plots.
+    original_feature_names: Raw feature column names for XGB importance chart.
+    feature_names         : Feature names for SHAP plots.
+    X_raw                 : Unscaled, unimputed feature DataFrame — same input fed
+                            to XGBoost during training.  Used for SHAP so that
+                            axis values remain on the original interpretable scale.
     """
     plots_dir = os.path.join(outputs_dir, "plots")
     os.makedirs(plots_dir, exist_ok=True)
@@ -253,33 +250,15 @@ def evaluate(ensemble_results: pd.DataFrame,
     composite  = percentile_scores["composite"]
     is_anomaly = ensemble_results["is_anomaly"].values
 
-    # ── 8.1 ROC-AUC and PR-AUC ───────────────────────────────────────────────
-    log.info("Step 8 — Evaluation …")
-    score_map = {
-        "XGBoost":         percentile_scores.get("xgb_pct"),
-        "IsolationForest": percentile_scores["if_pct"],
-        "Ensemble":        composite,
-    }
-    for model, scores in score_map.items():
-        if scores is None:
-            continue
-        auc = roc_auc_score(y_heuristic, scores)
-        log.info("  ROC-AUC %-16s %.4f", model, auc)
-
-    # ── 8.2 Precision@K (Ensemble) ────────────────────────────────────────────
-    for k in [100, 500, 1000]:
-        p = precision_at_k(y_heuristic, composite, k)
-        log.info("  Precision@%-5d (Ensemble) %.4f", k, p)
-
-    # ── 8.3 Model comparison table ────────────────────────────────────────────
+    # ── 8.1 Model comparison table ───────────────────────────────────────────
+    log.info("Step 8 — Evaluation & Model Comparison …")
     comparison = _model_comparison(y_heuristic, percentile_scores, xgb_proba, is_anomaly)
     log.info("\n%s", comparison.to_string())
     comparison.to_csv(os.path.join(outputs_dir, "model_comparison.csv"))
 
-    # ── 8.4 XGBoost-specific metrics ─────────────────────────────────────────
+    # ── 8.2 XGBoost-specific metrics ─────────────────────────────────────────
     if best_xgb is not None and xgb_proba is not None:
-        log.info("  XGBoost detailed evaluation …")
-        _evaluate_xgboost(best_xgb, X_scaled, y_heuristic,
+        _evaluate_xgboost(best_xgb, X_raw, y_heuristic,
                           original_feature_names, plots_dir)
 
     # ── 8.5 Top-50 flagged profile analysis ──────────────────────────────────
@@ -298,7 +277,7 @@ def evaluate(ensemble_results: pd.DataFrame,
     log.info("Step 9 — SHAP explanations …")
     if best_xgb is not None:
         try:
-            _shap_plots(best_xgb, X_scaled, feature_names, composite, plots_dir)
+            _shap_plots(best_xgb, X_raw, feature_names, composite, plots_dir)
         except Exception as e:
             log.warning("  SHAP explanation failed: %s — skipping SHAP plots.", str(e))
     else:

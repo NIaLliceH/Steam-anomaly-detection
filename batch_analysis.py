@@ -9,13 +9,13 @@ import sys
 # CONFIGURATION OF TARGET ACCOUNTS TO CHECK
 # ==========================================
 TARGET_STEAM_IDS = [
-    76561198287996067,
-    76561198399223263,
-    76561198350357346,
-    76561198405841744,
-    76561198354838543,
-    76561198391038255,
-    76561198147116758
+    # 76561198287996067,
+    # 76561198399223263,
+    # 76561198350357346,
+    # 76561198405841744,
+    # 76561198354838543,
+    # 76561198391038255,
+    # 76561198147116758
 ]
 
 CRAWL_DIR = "data/crawled"
@@ -51,10 +51,10 @@ def run_ml_pipeline():
     """Automatically call Machine Learning scripts"""
     print("\n=== 2. RUNNING AI PIPELINE (Please wait...) ===")
     print("[*] Running Phase 1 (Data Prep)...")
-    subprocess.run(["python3", "src/data_prep.py"], check=True)
+    subprocess.run(["python", "src/data_prep.py"], check=True)
     
     print("[*] Running Phase 2 (Anomaly Detection Model)...")
-    subprocess.run(["python3", "main.py"], check=True)
+    subprocess.run(["python", "main.py"], check=True)
 
 def _load_known_playerids():
     """
@@ -160,7 +160,8 @@ def build_report_data(target_ids):
             'if_pct': res.iloc[0]['if_pct'],
             'max_achievements_per_day': user_feat.get('max_achievements_per_day', 0),
             'normal_avg_achievements': normal_mean['max_achievements_per_day'],
-            'review_unowned_ratio': user_feat.get('review_unowned_ratio', 0),
+            'review_unplayed_ratio': user_feat.get('review_unplayed_ratio', 0),
+            'review_duplication_rate': user_feat.get('review_duplication_rate', 0),
             'cv_unlock_interval': user_feat.get('cv_unlock_interval', 0),
             'total_achievements': user_feat.get('total_achievements', 0),
         }
@@ -200,8 +201,10 @@ def generate_markdown_report(target_ids):
             if entry['max_achievements_per_day'] > 500:
                 md += f"- **Abnormal speed:** Unlocked {entry['max_achievements_per_day']:.0f} achievements/day (Average player only {entry['normal_avg_achievements']:.0f})\n"
             
-            if entry['review_unowned_ratio'] > 0.5:
-                md += f"- **Fake reviews:** {entry['review_unowned_ratio']*100:.1f}% of reviews are for games not owned.\n"
+            if entry['review_unplayed_ratio'] > 0.5:
+                md += f"- **Unplayed game reviews:** {entry['review_unplayed_ratio']*100:.1f}% of reviews are for games with 0 playtime.\n"
+            if entry['review_duplication_rate'] > 0.5:
+                md += f"- **Duplicate reviews:** {entry['review_duplication_rate']*100:.1f}% of reviews are copy-pasted duplicates.\n"
             
             if entry['cv_unlock_interval'] < 1.0 and entry['total_achievements'] > 100:
                 md += f"- **Tool/Macro usage:** Unlock speed too uniform like a preset machine (Dispersion coefficient = {entry['cv_unlock_interval']:.2f})\n"
@@ -403,8 +406,10 @@ def generate_html_report(target_ids):
             if entry['max_achievements_per_day'] > 500:
                 html += f'<div class="evidence-item">Abnormal speed: Unlocked {entry["max_achievements_per_day"]:.0f} achievements/day (Average player only {entry["normal_avg_achievements"]:.0f})</div>\n'
             
-            if entry['review_unowned_ratio'] > 0.5:
-                html += f'<div class="evidence-item">Fake reviews: {entry["review_unowned_ratio"]*100:.1f}% of reviews are for games not owned.</div>\n'
+            if entry['review_unplayed_ratio'] > 0.5:
+                html += f'<div class="evidence-item">Unplayed game reviews: {entry["review_unplayed_ratio"]*100:.1f}% of reviews are for games with 0 playtime.</div>\n'
+            if entry['review_duplication_rate'] > 0.5:
+                html += f'<div class="evidence-item">Duplicate reviews: {entry["review_duplication_rate"]*100:.1f}% of reviews are copy-pasted duplicates.</div>\n'
             
             if entry['cv_unlock_interval'] < 1.0 and entry['total_achievements'] > 100:
                 html += f'<div class="evidence-item">Tool/Macro usage: Unlock speed too uniform like a preset machine (Dispersion coefficient = {entry["cv_unlock_interval"]:.2f})</div>\n'
@@ -466,8 +471,10 @@ def generate_report(target_ids, output_format='console'):
                 if entry['max_achievements_per_day'] > 500:
                     print(f"      - Abnormal speed: Unlocked {entry['max_achievements_per_day']:.0f} achievements/day (Average player only {entry['normal_avg_achievements']:.0f})")
                 
-                if entry['review_unowned_ratio'] > 0.5:
-                    print(f"      - Fake reviews: {entry['review_unowned_ratio']*100:.1f}% of reviews are for games not owned.")
+                if entry['review_unplayed_ratio'] > 0.5:
+                    print(f"      - Unplayed game reviews: {entry['review_unplayed_ratio']*100:.1f}% of reviews are for games with 0 playtime.")
+                if entry['review_duplication_rate'] > 0.5:
+                    print(f"      - Duplicate reviews: {entry['review_duplication_rate']*100:.1f}% of reviews are copy-pasted duplicates.")
                     
                 if entry['cv_unlock_interval'] < 1.0 and entry['total_achievements'] > 100:
                     print(f"      - Tool/Macro usage: Unlock speed too uniform like a preset machine (Dispersion coefficient = {entry['cv_unlock_interval']:.2f})")
@@ -498,10 +505,10 @@ if __name__ == "__main__":
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
-  python3 batch_analysis.py                           # Full pipeline (if new data exists)
-  python3 batch_analysis.py --query-only              # Skip injection, query existing results only
-  python3 batch_analysis.py --query-only --steam-ids 123 456  # Query specific player IDs
-  python3 batch_analysis.py --force-run               # Force run pipeline even without new data
+  python batch_analysis.py                           # Full pipeline (if new data exists)
+  python batch_analysis.py --query-only              # Skip injection, query existing results only
+  python batch_analysis.py --query-only --steam-ids 123 456  # Query specific player IDs
+  python batch_analysis.py --force-run               # Force run pipeline even without new data
         """
     )
     
@@ -548,10 +555,10 @@ Examples:
         if data_injected or args.force_run:
             print("\n=== 2. RUNNING AI PIPELINE (Please wait...) ===")
             print("[*] Running Phase 1 (Data Prep)...")
-            subprocess.run(["python3", "src/data_prep.py"], check=True)
+            subprocess.run(["python", "src/data_prep.py"], check=True)
             
             print("[*] Running Phase 2 (Anomaly Detection Model)...")
-            subprocess.run(["python3", "main.py"], check=True)
+            subprocess.run(["python", "main.py"], check=True)
         else:
             print("\n[*] No new data injected. Skipping pipeline and using existing results.")
         

@@ -136,6 +136,13 @@ def load_history(private_ids: set) -> pd.DataFrame:
     df = _merge_with_crawled(df, "history.csv")
     log.info("  Raw rows: %d", len(df))
 
+    if "date_accquired" in df.columns:
+        if "date_acquired" in df.columns:
+            df["date_acquired"] = df["date_acquired"].fillna(df["date_accquired"])
+        else:
+            df["date_acquired"] = df["date_accquired"]
+        df = df.drop(columns=["date_accquired"])
+
     # Extract gameid safely — achievement names may contain underscores
     df["gameid"] = (
         df["achievementid"]
