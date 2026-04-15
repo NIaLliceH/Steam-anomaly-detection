@@ -28,8 +28,6 @@ from features import (
     add_time_components,
     build_feature_matrix,
     build_heuristic_labels,
-    build_player_library,
-    build_zero_playtime_library,
 )
 from models import (
     apply_log_transform,
@@ -83,29 +81,9 @@ def main() -> None:
     history, players, reviews, purchased = load_parquets()
     history = add_time_components(history)
     feature_reference_time = pd.to_datetime(history["date_acquired"], errors="coerce").max()
-    log.info("Feature reference timestamp (fixed): %s", feature_reference_time)
+    log.info("Feature reference timestamp (last achievement record): %s", feature_reference_time)
 
-    log.info("Building player library lookup …")
-    player_library        = build_player_library(purchased)
-    zero_playtime_library = build_zero_playtime_library(purchased)
-
-    # ── Step 2: Heuristic Labels V2 ───────────────────────────────────────────
-    heuristic_df = build_heuristic_labels(
-        history, reviews,
-        zero_playtime_library,
-        players,
-    )
-
-    # ── Active Learning: integrate human overrides (if reviewed.csv exists) ───
-    # reviewed_csv = os.path.join(OUTPUTS_DIR, "reviewed.csv")
-    reviewed_csv = os.path.join(REVIEWED_CSV)  # Use reviewed.csv from data/ (updated by auto_label.py)
-    heuristic_df = integrate_human_labels(heuristic_df, reviewed_csv)
-
-    heuristic_path = os.path.join(OUTPUTS_DIR, "heuristic_labels.csv")
-    heuristic_df.to_csv(heuristic_path)
-    log.info("Saved → %s", heuristic_path)
-
-    # ── Step 3: Feature Engineering ──────────────────────────────────────────
+    # ── Step 3: Feature Engineering (FIRST — heuristic labels reuse results) ──
     feature_matrix = build_feature_matrix(
         history, reviews, players, purchased, feature_reference_time,
     )
@@ -113,21 +91,18 @@ def main() -> None:
     feature_matrix.to_csv(fm_path)
     log.info("Saved → %s", fm_path)
 
-    # ── Data Trimming — remove sparse/ghost accounts before modelling ─────────
-    # Ghost accounts (0-1 achievements, no library) dominate the 196k dataset.
-    # Their presence causes IQR ≈ 0 for most features → StandardScaler (and the
-    # old RobustScaler) blows up the scale for real players → 98%+ variance in
-    # PC1 and ~6% Precision.  Trimming to players with ≥ 10 achievements AND
-    # ≥ 1 owned game retains meaningful signal while removing noise.
-    n_before = len(feature_matrix)
-    feature_matrix = feature_matrix[
-        (feature_matrix["total_achievements"] >= 10)
-        & (feature_matrix["library_size"] >= 1)
-    ]
-    log.info("Data trimming: %d → %d players (removed %d ghost accounts)",
-             n_before, len(feature_matrix), n_before - len(feature_matrix))
+    # ── Step 2: Heuristic Labels (consumes pre-computed feature_matrix) ───────
+    heuristic_df = build_heuristic_labels(feature_matrix)
 
-    # ── Step 4: Align + Preprocess (with PCA) ────────────────────────────────
+    # ── Active Learning: integrate human overrides (if reviewed.csv exists) ───
+    reviewed_csv = os.path.join(REVIEWED_CSV)  # updated by auto_label.py
+    heuristic_df = integrate_human_labels(heuristic_df, reviewed_csv)
+
+    heuristic_path = os.path.join(OUTPUTS_DIR, "heuristic_labels.csv")
+    heuristic_df.to_csv(heuristic_path)
+    log.info("Saved → %s", heuristic_path)
+
+    # ── Step 4: Align ─────────────────────────────────────────────────────────
     common_ids  = feature_matrix.index.intersection(heuristic_df.index)
     X_raw       = feature_matrix.loc[common_ids]
     y_heuristic = heuristic_df.loc[common_ids, "heuristic_bot"]
@@ -135,31 +110,37 @@ def main() -> None:
     original_feature_names = X_raw.columns.tolist()
     log.info("Common players for modelling: %d", len(common_ids))
 
-    # Log-transform heavy-tailed features before scaling.
-    # Needed for IsolationForest path-length stability: uniform random splits on
-    # a feature spanning 6+ orders of magnitude are unrepresentative of actual
-    # data density.  log1p re-balances the split distribution without affecting
-    # XGBoost, which is invariant to monotonic feature transformations.
+    # ── Path A: IsolationForest — log-transform → impute → scale ─────────────
+    # IF uses random splits on individual features; extreme outliers (6+ orders
+    # of magnitude) make uniform split sampling unrepresentative of true density.
+    # log1p re-balances the marginal distributions.  SimpleImputer + StandardScaler
+    # are then applied so path-length comparisons are not biased by magnitude.
     X_log = apply_log_transform(X_raw)
-
-    X_scaled, preprocessor, feature_names = preprocess(
+    X_if, preprocessor_if, feature_names = preprocess(
         X_log, save_path=os.path.join(OUTPUTS_DIR, "preprocessor.pkl")
     )
 
+    # ── Path B: XGBoost — raw features, no imputer, no scaler ────────────────
+    # XGBoost handles NaN natively via sparsity-aware split finding; imputing
+    # destroys the missing-data signal (e.g. NaN review features for players
+    # with no reviews is informative, not a gap to fill).  XGBoost is also
+    # invariant to monotonic transforms, so neither log1p nor scaling helps.
+    # X_raw is passed directly to train_xgboost_semisupervised below.
+
     # ── Step 5a: Hyperparameter Tuning (IsolationForest) ─────────────────────
-    best_if_params, tuning_results = tune_models(X_scaled, y_heuristic)
+    best_if_params, tuning_results = tune_models(X_if, y_heuristic)
     tuning_path = os.path.join(OUTPUTS_DIR, "tuning_results.csv")
     tuning_results.to_csv(tuning_path, index=False)
     log.info("Saved → %s", tuning_path)
 
     # ── Step 6: Train Final IsolationForest ──────────────────────────────────
-    models, scores = train_best_models(X_scaled, best_if_params)
+    models, scores = train_best_models(X_if, best_if_params)
     joblib.dump(models["IsolationForest"], os.path.join(OUTPUTS_DIR, "best_if.pkl"))
     log.info("Saved → %s", os.path.join(OUTPUTS_DIR, "best_if.pkl"))
-    
-    # ── Step 5b: XGBoost (PRIMARY model) ─────────────────────────────────────
+
+    # ── Step 5b: XGBoost — raw features (Path B) ─────────────────────────────
     best_xgb, xgb_proba, _ = train_xgboost_semisupervised(
-        X_log, y_heuristic, y_normal, preprocessor, OUTPUTS_DIR
+        X_raw, y_heuristic, y_normal, OUTPUTS_DIR
     )
 
     # ── Step 7: Ensemble V2 ───────────────────────────────────────────────────
@@ -187,11 +168,11 @@ def main() -> None:
         percentile_scores      = percentile_scores,
         y_heuristic            = y_heuristic,
         feature_matrix         = feature_matrix.loc[common_ids],
-        feature_names          = feature_names,        # original feature names for SHAP
-        X_scaled               = X_scaled,
+        feature_names          = feature_names,
+        X_raw                  = X_raw,          # unscaled, for SHAP interpretability
         best_xgb               = best_xgb,
         xgb_proba              = xgb_proba,
-        original_feature_names = original_feature_names,  # raw names for XGB importance
+        original_feature_names = original_feature_names,
         outputs_dir            = OUTPUTS_DIR,
     )
 

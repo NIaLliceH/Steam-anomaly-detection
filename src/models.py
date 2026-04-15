@@ -36,7 +36,6 @@ _LOG_TRANSFORM_COLS = frozenset([
     "max_achievements_per_day",
     "max_achievements_per_minute",
     "median_unlock_interval_sec",
-    "min_unlock_interval_sec",
     "std_unlock_interval_sec",
     "avg_achievements_per_game",
     "library_size",
@@ -178,27 +177,32 @@ def train_xgboost_semisupervised(
         X_raw: pd.DataFrame,
         y_heuristic: pd.Series,
         y_normal: pd.Series,
-        preprocessor: Pipeline,
         outputs_dir: str) -> tuple:
     """
     Train XGBoost using Positive-Unlabeled (PU) Learning logic.
 
+    XGBoost receives raw (unscaled, unimputed) features directly:
+      - XGBoost handles NaN natively via its sparsity-aware split finding;
+        imputing median values would destroy the missing-data signal
+        (e.g. a player with no reviews legitimately has NaN review features).
+      - XGBoost is invariant to monotonic feature transformations, so scaling
+        and log-transform provide no benefit and are skipped for this path.
+
     Training is restricted to the confident subset:
       - heuristic_bot == 1  (confirmed bots)
-      - heuristic_normal == 1  (confirmed normals: > 10 achievements AND
-                                median interval > 30 min)
-    The ambiguous grey area (neither confirmed bot nor confirmed normal) is
-    excluded from .fit() to avoid noisy labels polluting the decision boundary.
+      - heuristic_normal == 1  (confirmed normals)
+    The ambiguous grey area is excluded to avoid noisy labels polluting the
+    decision boundary.
 
-    Prediction (predict_proba) runs on the ENTIRE trimmed dataset so every
-    player receives an anomaly score for ensemble scoring.
+    Prediction (predict_proba) runs on the ENTIRE dataset so every player
+    receives an anomaly score for ensemble scoring.
 
     Returns (best_xgb, xgb_proba_full, common_ids).
     """
-    log.info("Step 5b — XGBoost PU-Learning training …")
+    log.info("Step 5b — XGBoost PU-Learning training (raw features, no scaling) …")
 
     common_ids  = X_raw.index.intersection(y_heuristic.index)
-    X_all       = X_raw.loc[common_ids]          # full trimmed set (for scoring)
+    X_all       = X_raw.loc[common_ids]          # full set (for scoring)
     y_bot_all   = y_heuristic.loc[common_ids]
     y_norm_all  = y_normal.reindex(common_ids).fillna(0).astype(int)
 
@@ -216,11 +220,6 @@ def train_xgboost_semisupervised(
 
     scale_pos_weight = neg_count / max(pos_count, 1)
     log.info("  Class imbalance ratio (scale_pos_weight): %.2f", scale_pos_weight)
-
-    X_train_scaled = pd.DataFrame(
-        preprocessor.transform(X_train),
-        index=X_train.index, columns=X_train.columns,
-    )
 
     param_distributions = {
         "n_estimators":     [200, 500, 1000],
@@ -254,19 +253,15 @@ def train_xgboost_semisupervised(
     )
 
     log.info("  Running RandomizedSearchCV (n_iter=50, cv=5) …")
-    search.fit(X_train_scaled, y_train)
+    search.fit(X_train, y_train)   # raw features — XGBoost handles NaN natively
 
     log.info("  Best CV PR-AUC: %.4f", search.best_score_)
     log.info("  Best params: %s", search.best_params_)
 
     best_xgb = search.best_estimator_
 
-    # Score ALL players in the trimmed dataset (not just the training subset)
-    X_all_scaled = pd.DataFrame(
-        preprocessor.transform(X_all),
-        index=X_all.index, columns=X_all.columns,
-    )
-    xgb_proba_full = best_xgb.predict_proba(X_all_scaled)[:, 1]
+    # Score ALL players (not just the training subset)
+    xgb_proba_full = best_xgb.predict_proba(X_all)[:, 1]
 
     joblib.dump(best_xgb, os.path.join(outputs_dir, "best_xgb.pkl"))
     pd.DataFrame(search.cv_results_).to_csv(
@@ -320,7 +315,7 @@ def build_ensemble(scores: dict,
 
     if xgb_proba is not None:
         xgb_pct   = rankdata(xgb_proba) / len(xgb_proba) * 100
-        composite = 0.70 * xgb_pct + 0.30 * if_pct
+        composite = 0.65 * xgb_pct + 0.35 * if_pct
         xgb_flag  = (xgb_pct >= 95).astype(int)
     else:
         xgb_pct   = np.zeros(len(if_pct))

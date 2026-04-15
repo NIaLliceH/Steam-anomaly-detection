@@ -105,149 +105,82 @@ def build_zero_playtime_library(purchased: pd.DataFrame) -> dict:
 # Step 2 — Heuristic Labels
 # ---------------------------------------------------------------------------
 
-def build_heuristic_labels(history: pd.DataFrame,
-                            reviews: pd.DataFrame,
-                            zero_playtime_library: dict,
-                            players: pd.DataFrame) -> pd.DataFrame:
+def build_heuristic_labels(feature_matrix: pd.DataFrame) -> pd.DataFrame:
     """
     Create pseudo ground truth (heuristic_bot = 0/1) using 3 AND-rule groups.
 
-    V2 changes vs V1:
-    - OR logic → AND logic per group to reduce false positives.
-      V1's OR rules flagged 98%+ of players; AND rules target only clear bots.
-    - 3 distinct bot archetypes: Speed bot, Volume bot, Review bot.
-    - Review bot rule requires BOTH review_unplayed_ratio > 0.50 AND
-      review_dup_ratio > 0.50 simultaneously, combining a behavioural signal
-      (reviewing unplayed games) with a textual signal (copy-paste reviews).
-    - night_ratio is computed in local time via per-player UTC offset from
-      _COUNTRY_UTC_OFFSET, using country codes from the players DataFrame.
+    Accepts the pre-computed feature_matrix (output of build_feature_matrix) so
+    that speed, temporal, review, and playtime signals are not duplicated — the
+    previous version recomputed median_interval, max_per_day, night_ratio, etc.
+    from raw tables, identical to what build_feature_matrix already computed.
+
+    Bot archetypes
+    --------------
+    Speed bot  : median_unlock_interval_sec < 10 s AND top1_game_concentration > 0.85
+    Volume bot : (max_per_day > 500 AND night > 40% AND total_ach > 1000)
+                 OR zero_playtime_achievements_ratio > 0.9  (SAM unlocker catch-all)
+    Review bot : total_reviews > 5 AND total_achievements == 0
+                 AND review_unplayed_ratio > 0.50 AND review_duplication_rate > 0.50
+
+    Normal definition (for PU Learning)
+    ------------------------------------
+    total_achievements > 10 AND median_unlock_interval_sec > 600 (10 min).
+    Threshold lowered from 30 min → 10 min to better reflect realistic gameplay
+    pace and reduce confident-normal class under-representation.
     """
-    log.info("Step 2 — Building heuristic labels …")
+    log.info("Step 2 — Building heuristic labels from feature matrix …")
 
-    # ── Speed stats ──────────────────────────────────────────────────────────
-    diffs = (
-        history.sort_values(["playerid", "date_acquired"])
-        .groupby("playerid")["date_acquired"]
-        .apply(lambda x: x.diff().dt.total_seconds())
-    )
-    median_interval = diffs.groupby(level=0).median().rename("median_interval")
-    min_interval    = diffs.groupby(level=0).min().rename("min_interval")
+    fm = feature_matrix
 
-    # ── Game concentration ────────────────────────────────────────────────────
-    top1_conc = (
-        history.groupby(["playerid", "gameid"]).size()
-        .groupby(level=0).apply(lambda x: x.max() / x.sum())
-        .rename("top1_concentration")
-    )
+    # Safe defaults: NaN in rule features → conservative non-bot value
+    median_ivl  = fm["median_unlock_interval_sec"].fillna(np.inf)
+    top1_conc   = fm["top1_game_concentration"].fillna(0.0)
+    max_per_day = fm["max_achievements_per_day"].fillna(0.0)
+    night       = fm["night_activity_ratio"].fillna(0.0)
+    total_ach   = fm["total_achievements"].fillna(0.0)
+    total_rev   = fm["total_reviews"].fillna(0.0)
+    unplayed    = fm["review_unplayed_ratio"].fillna(0.0)
+    dup_rate    = fm["review_duplication_rate"].fillna(0.0)
+    zp_ratio    = fm["zero_playtime_achievements_ratio"].fillna(0.0)
+    avg_rev_len  = fm["avg_review_length"].fillna(0.0)
 
-    # ── Max achievements per day ──────────────────────────────────────────────
-    max_per_day = (
-        history.groupby(["playerid", "date_only"]).size()
-        .groupby(level=0).max()
-        .rename("max_per_day")
-    )
+    # ── Group 1: SPEED BOT ────────────────────────────────────────────────────
+    speed_bot = (median_ivl < 10) & (top1_conc > 0.85)
 
-    # ── Night activity ratio (00:00–05:59 local time) ────────────────────────
-    # Per-player UTC offset from country code; unknown countries default to 0.
-    offset_map = (
-        players.set_index("playerid")["country"]
-        .astype(str)
-        .map(_COUNTRY_UTC_OFFSET)
-        .fillna(0)
-        .astype(int)
-    )
-    _h = history.copy()
-    _h["local_hour"] = (_h["hour"] + _h["playerid"].map(offset_map).fillna(0).astype(int)) % 24
-    night_counts = _h[_h["local_hour"] < 6].groupby("playerid").size().rename("_night")
-    total_counts = history.groupby("playerid").size().rename("_total")
-    night_ratio  = (night_counts / total_counts).rename("night_ratio").fillna(0)
-
-    # ── Achievement and review counts ─────────────────────────────────────────
-    ach_counts    = history.groupby("playerid").size().rename("ach_count")
-    review_counts = reviews.groupby("playerid").size().rename("review_count")
-
-    # ── Review signals for Group 3 (both always computed) ────────────────────
-    # Signal A — review_unplayed_ratio: fraction of reviews written for games
-    #   the player owns but has never launched (playtime == 0)
-    def _unplayed(group: pd.DataFrame) -> float:
-        pid = int(group.name)
-        if pid not in zero_playtime_library:
-            return np.nan
-        return group["gameid"].apply(int).isin(zero_playtime_library[pid]).mean()
-
-    unplayed_ratio = (
-        reviews.groupby("playerid")
-        .apply(_unplayed, include_groups=False)
-        .rename("_unplayed_ratio")
-    )
-
-    # Signal B — review_dup_ratio: fraction of duplicate/copy-paste reviews.
-    #   Review bots post the same boilerplate text across many titles.
-    def _dup_rate(s: pd.Series) -> float:
-        cleaned = s.fillna("").str.lower().str.strip()
-        return 0.0 if len(cleaned) <= 1 else 1.0 - (cleaned.nunique() / len(cleaned))
-
-    dup_ratio = (
-        reviews.groupby("playerid")["review"]
-        .apply(_dup_rate)
-        .rename("_dup_ratio")
-    )
-
-
-    df = pd.concat(
-        [median_interval, min_interval, top1_conc, max_per_day,
-         night_ratio, ach_counts, review_counts, unplayed_ratio, dup_ratio],
-        axis=1,
-    ).fillna({"review_count": 0, "night_ratio": 0.0, "min_interval": 0.0,
-              "_unplayed_ratio": 0.0, "_dup_ratio": 0.0})
-
-    # ── Group 1: SPEED BOT — fast unlock AND concentrated in one game ─────────
-    # Real players need ≥ 30s between achievements even in easy games.
-    speed_bot = (
-        (df["median_interval"] < 10)        # median < 10 s
-        & (df["min_interval"]  < 1)         # at least one unlock < 1 s
-        & (df["top1_concentration"] > 0.85) # 85%+ achievements from a single game
-    )
-
-    # ── Group 2: VOLUME BOT — inhuman volume AND nocturnal activity ───────────
-    # 500 achievements/day = 1 every 3 minutes, 24/7 — impossible for humans.
+    # ── Group 2: VOLUME BOT ───────────────────────────────────────────────────
+    # Primary: inhuman unlock volume + nocturnal pattern.
+    # OR: >90% achievements on unplayed games = deterministic SAM signal.
     volume_bot = (
-        (df["max_per_day"]  > 500)
-        & (df["night_ratio"] > 0.40)        # > 40% activity between 00:00–05:59
-        & (df["ach_count"]   > 1000)        # total ≥ 1 000 achievements
-    )
+        (max_per_day > 500) & (night > 0.40) & (total_ach > 1000)
+    ) | (zp_ratio > 0.9)
 
-    # ── Group 3: REVIEW BOT — zero gameplay + dual review signal ────────────────
+    # ── Group 3: REVIEW BOT ───────────────────────────────────────────────────
+    # Both dual signals required to prevent false positives from players who
+    # merely review a few unplayed demos or use short identical templates.
     review_bot = (
-        (df["review_count"]     > 5)     # enough sample to be meaningful
-        & (df["ach_count"]     == 0)     # never actually played any game
-        & (df["_unplayed_ratio"] > 0.50) # behavioural: reviews unplayed games
-        & (df["_dup_ratio"]      > 0.30) # textual: copy-paste review content
+        (total_rev > 5)
+        & (total_ach < 5) # Tài khoản gần như không chơi game
+        & (unplayed > 0.50)
+        & (dup_rate > 0.50)
+        & (avg_rev_len < 50) # Thêm: Review rác thường rất ngắn (< 50 ký tự)
     )
 
-    df["heuristic_bot"] = (speed_bot | volume_bot | review_bot).astype(int)
-
-    # ── Strict normal definition for PU Learning ──────────────────────────────
-    # These players are confidently NOT bots: they have meaningful achievement
-    # history (> 10) AND unlock achievements at a human pace (median > 30 min).
-    # Used to filter the XGBoost training set to "confident bot vs confident
-    # normal", dropping the ambiguous grey area that would add noise to labels.
-    heuristic_normal = (
-        (df["ach_count"] > 10)
-        & (df["median_interval"] > 1800)  # > 30 minutes between achievements
+    result = pd.DataFrame(index=fm.index)
+    result["heuristic_bot"]    = (speed_bot | volume_bot | review_bot).astype(int)
+    result["heuristic_normal"] = (
+        (total_ach > 10) & (median_ivl > 600)
     ).astype(int)
-    df["heuristic_normal"] = heuristic_normal
 
-    log.info("  Speed bots:       %d", speed_bot.sum())
-    log.info("  Volume bots:      %d", volume_bot.sum())
-    log.info("  Review bots:      %d", review_bot.sum())
-    n_bot = df["heuristic_bot"].sum()
-    n_normal = df["heuristic_normal"].sum()
+    log.info("  Speed bots:       %d", int(speed_bot.sum()))
+    log.info("  Volume bots:      %d", int(volume_bot.sum()))
+    log.info("  Review bots:      %d", int(review_bot.sum()))
+    n_bot    = int(result["heuristic_bot"].sum())
+    n_normal = int(result["heuristic_normal"].sum())
     log.info("  Heuristic bots   (total unique): %d (%.2f%%)",
-             n_bot, df["heuristic_bot"].mean() * 100)
+             n_bot,    result["heuristic_bot"].mean()    * 100)
     log.info("  Heuristic normal (total unique): %d (%.2f%%)",
-             n_normal, df["heuristic_normal"].mean() * 100)
-    return df[["heuristic_bot", "heuristic_normal"]]
+             n_normal, result["heuristic_normal"].mean() * 100)
+    return result
 
 
 # ---------------------------------------------------------------------------
@@ -266,7 +199,6 @@ def _speed_features(history: pd.DataFrame) -> pd.DataFrame:
 
     speed = h.groupby("playerid")["interval_sec"].agg(
         median_unlock_interval_sec="median",
-        min_unlock_interval_sec="min",
         std_unlock_interval_sec="std",
     )
     mean_interval = h.groupby("playerid")["interval_sec"].mean()
@@ -344,12 +276,7 @@ def _temporal_features(history: pd.DataFrame, players: pd.DataFrame) -> pd.DataF
     )
     activity_density = (active_days / span["span_days"]).rename("activity_density")
 
-    weekend_ratio = (
-        history.groupby("playerid")["day_of_week"]
-        .apply(lambda x: x.isin([5, 6]).mean())
-        .rename("weekend_ratio")
-    )
-    return pd.concat([night_ratio, hour_entropy, activity_density, weekend_ratio], axis=1)
+    return pd.concat([night_ratio, hour_entropy, activity_density], axis=1)
 
 
 def _diversity_features(history: pd.DataFrame,
@@ -380,7 +307,7 @@ def _diversity_features(history: pd.DataFrame,
     avg_ach_per_game = (total_achievements / games_with_ach).rename("avg_achievements_per_game")
 
     return pd.concat(
-        [total_achievements, games_with_ach, lib_size,
+        [total_achievements, lib_size,
          ach_game_ratio, top1_conc, top3_conc, game_hhi, avg_ach_per_game],
         axis=1,
     )
@@ -555,29 +482,44 @@ def build_feature_matrix(history: pd.DataFrame,
     """
     Step 3: Compute all per-player features across 6 groups (A–F).
 
-    Early Trimming
+    Trimming
     --------------
     The raw history table contains ~196 K distinct players, but ~193 K of them
     have fewer than 10 achievements and would be discarded by the downstream
     PU-learning filter anyway.  Computing Shannon entropy, inter-arrival
     standard deviation, HHI, and playtime cross-joins for those players wastes
-    significant CPU and RAM.  Trimming to ≥10-achievement players *before* any
-    heavy groupby/merge reduces the working set by ~98% and cuts wall-clock
-    feature-engineering time proportionally.
+    significant CPU and RAM.  Trimming *before* any heavy groupby/merge reduces
+    the working set by ~98% and cuts wall-clock feature-engineering time
+    proportionally.
 
-    The threshold (10) matches the `heuristic_normal` definition in
-    `build_heuristic_labels`, so trimming here is consistent with the label
-    generation logic.
+    Criteria: (≥10 achievements OR ≥3 reviews) AND library_size ≥ 1.
+    - OR logic: keeps Review Bot candidates who have 0 achievements but spam reviews.
+    - library_size ≥ 1: excludes ghost accounts with no owned games (they would
+      produce NaN-only playtime feature rows with no bot signal).
     """
     log.info("Step 3 — Building feature matrix …")
 
-    # ── Early Trimming ────────────────────────────────────────────────────────
-    ach_counts_all = history.groupby("playerid").size()
-    core_ids = ach_counts_all[ach_counts_all >= 10].index
+    # ── Trimming ─────────────────────────────────────────────────────────────
+    # Keep players with ≥10 achievements (bot/normal signal) OR ≥3 reviews
+    # (Review Bot candidates who have 0 achievements but spam reviews).
+    # Pure review bots are dropped by the old ≥10 achievements-only filter,
+    # making the Review Bot heuristic rule impossible to fire.
+    # Also require library_size ≥ 1 to exclude ghost accounts with no owned games
+    # (they have no playtime signal and would produce NaN-only feature rows).
+    ach_counts_all    = history.groupby("playerid").size()
+    review_counts_all = reviews.groupby("playerid").size()
+    lib_sizes = purchased.set_index("playerid")["library_size"].fillna(0)
+    has_library = lib_sizes[lib_sizes >= 1].index
+    core_ids = (
+        ach_counts_all[ach_counts_all >= 10].index
+        .union(review_counts_all[review_counts_all >= 3].index)
+    ).intersection(has_library)
+    total_unique = len(
+        set(history["playerid"].unique()) | set(reviews["playerid"].unique())
+    )
     log.info(
-        "  Early trim: %d total players → %d with ≥10 achievements (%d dropped)",
-        ach_counts_all.shape[0], len(core_ids),
-        ach_counts_all.shape[0] - len(core_ids),
+        "  Trimming: %d total players → %d with (≥10 achievements OR ≥3 reviews) AND library_size ≥ 1 (%d dropped)",
+        total_unique, len(core_ids), total_unique - len(core_ids),
     )
     history   = history[history["playerid"].isin(core_ids)].copy()
     reviews   = reviews[reviews["playerid"].isin(core_ids)].copy()

@@ -46,63 +46,46 @@ Output: `data/processed/*.parquet` (history, players, reviews, purchased)
 - `load_parquets()` → history, players, reviews, purchased
 - `add_time_components()` → thêm cols `hour`, `day_of_week`, `date_only` cho history
 - `feature_reference_time` = max(date_acquired) → mốc thời gian cố định để tính `account_age_days`
-- `build_player_library()` → `{playerid: set(appid)}` cho O(1) lookup *(hiện chưa dùng trong pipeline chính)*
-- `build_zero_playtime_library()` → `{playerid: set(appid)}` chỉ chứa game có `playtime_mins == 0`
 
-### Heuristic labels - `features.py`
-- `build_heuristic_labels(history, reviews, zero_playtime_library, players)`
-  - `median_interval`, `min_interval` từ history (diff giữa các achievement liên tiếp)
-  - `top1_concentration` → max achievement 1 game / tổng achievement
-  - `max_per_day` → max achievement trong 1 ngày
-  - `night_ratio` → tỉ lệ achievement trong 00:00–05:59 **local time** (dùng `_COUNTRY_UTC_OFFSET` từ `players.country`)
-  - `ach_counts`, `review_counts`
-  - `_unplayed_ratio` → fraction reviews cho game có playtime == 0 (từ `zero_playtime_library`)
-  - `_dup_ratio` → 1 − (unique_texts / total_reviews)
-  - `heuristic_bot` = speed_bot | volume_bot | review_bot
-    - **Speed bot**: median_interval < 10s AND min_interval < 1s AND top1_concentration > 0.85
-    - **Volume bot**: max_per_day > 500 AND night_ratio > 0.40 AND ach_count > 1000
-    - **Review bot**: review_count > 5 AND ach_count == 0 AND **_unplayed_ratio > 0.50 AND _dup_ratio > 0.50** (cả hai tín hiệu bắt buộc)
-  - `heuristic_normal` → ach_count > 10 AND median_interval > 1800s (dùng cho PU Learning)
-- `integrate_human_labels()` → override heuristic_bot/normal bằng nhãn từ `data/reviewed.csv` (HITL loop)
-
-## Feature engineering - `features.py`
-### Early Trimming (trong `build_feature_matrix`)
-- Lọc history xuống players có **≥ 10 achievements** trước khi tính bất kỳ feature nào
+### Feature engineering - `features.py`
+#### Trimming (trong `build_feature_matrix`, trước khi tính bất kỳ feature nào)
+- Điều kiện: **(≥10 achievements OR ≥3 reviews) AND library_size ≥ 1**
+  - OR logic: giữ lại Review Bot candidates có 0 achievement nhưng spam review
+  - `library_size ≥ 1`: loại ghost accounts không có game nào (sẽ sinh NaN-only feature rows)
 - Giảm ~98% working set (~196K → ~3K players), tăng tốc toàn bộ groupby/merge
+- Thực hiện một lần duy nhất; không còn bước trimming thứ hai trong `main.py`
 
-### Group A: `_speed_features()`
-- `median_unlock_interval_sec`, `min_unlock_interval_sec`, `std_unlock_interval_sec`
+#### Group A: `_speed_features()`
+- `median_unlock_interval_sec`, `std_unlock_interval_sec`
 - `cv_unlock_interval` = std / mean (coefficient of variation)
 - `max_achievements_per_minute`
 - `max_achievements_per_day`
 
-### Group B: `_temporal_features()`
+#### Group B: `_temporal_features()`
 - `night_activity_ratio` → local_hour < 6 (timezone-aware, dùng `_COUNTRY_UTC_OFFSET`)
 - `hour_entropy` → Shannon entropy phân phối achievement theo 24 giờ (local time)
 - `activity_density` → active_days / calendar_span (ngày đầu đến ngày cuối)
-- `weekend_ratio` → tỉ lệ achievement vào cuối tuần (day_of_week ∈ {5, 6})
 
-### Group C: `_diversity_features()`
+#### Group C: `_diversity_features()`
 - `total_achievements`
-- `games_with_achievements` → số game có ít nhất 1 achievement
 - `library_size`
-- `achievement_game_ratio` → games_with_achievements / library_size
+- `achievement_game_ratio` → games_with_achievements / library_size *(games_with_achievements tính nội bộ, không export)*
 - `top1_game_concentration` → % achievement từ game có nhiều nhất
 - `top3_game_concentration` → % achievement từ 3 game nhiều nhất
 - `game_hhi` → Herfindahl index = Σ(game_proportion²)
 - `avg_achievements_per_game` → total_achievements / games_with_achievements
 
-### Group D: `_review_features()`
+#### Group D: `_review_features()`
 - `total_reviews`
 - `review_unplayed_ratio` → fraction reviews cho game có playtime == 0
 - `review_duplication_rate` → 1 − (unique_texts / total_reviews)
 - `avg_review_length`, `min_review_length`
 
-### Group E: `_account_age_features()`
+#### Group E: `_account_age_features()`
 - `days_before_first_achievement` → first_achievement_date − account_created_date
 - `account_age_days` → feature_reference_time − account_created_date
 
-### Group F: `_playtime_features()`
+#### Group F: `_playtime_features()`
 - Left-join history với purchased library:
   - **Condition A**: game có trong history nhưng không có trong library → API lag → bỏ qua
   - **Condition B**: game trong library với playtime > 0 → gameplay bình thường
@@ -111,31 +94,43 @@ Output: `data/processed/*.parquet` (history, players, reviews, purchased)
 - `total_playtime_mins` = tổng playtime của các game thuộc B (distinct game, tránh inflate)
 - `playtime_per_achievement` = total_playtime_mins / (B + C)
 
-**Tổng cộng: 28 features**
+**Tổng cộng: 25 features**
 
-### Data Trimming (trong `main.py`, sau `build_feature_matrix`)
-- Lọc lần hai: `total_achievements >= 10 AND library_size >= 1`
-- Loại bỏ ghost accounts còn sót (không có library sau khi tính feature)
+
+### Heuristic labels - `features.py`
+`build_heuristic_labels(feature_matrix)` — đọc trực tiếp từ các cột của feature_matrix (không tính lại từ raw tables).
+
+- **Speed bot**: `median_unlock_interval_sec < 10s` AND `top1_game_concentration > 0.85`
+- **Volume bot**: (`max_per_day > 500` AND `night_activity_ratio > 0.40` AND `total_achievements > 1000`) OR `zero_playtime_achievements_ratio > 0.9` (SAM catch-all)
+- **Review bot**: `total_reviews > 5` AND `total_achievements == 0` AND `review_unplayed_ratio > 0.50` AND `review_duplication_rate > 0.50`
+- `heuristic_bot` = speed_bot | volume_bot | review_bot
+- `heuristic_normal` → `total_achievements > 10` AND `median_unlock_interval_sec > 600s` (10 min, dùng cho PU Learning)
+
+`integrate_human_labels()` → override heuristic_bot/normal bằng nhãn từ `data/reviewed.csv` (HITL loop)
 
 
 ## Preprocessing - `models.py`
-- `apply_log_transform()` → `log1p(clip(x, 0))` cho 10 heavy-tailed features
+Hai paths riêng biệt cho IF và XGBoost:
+
+**Path A — IsolationForest**: `apply_log_transform()` → `preprocess()` (SimpleImputer + StandardScaler)
+- `apply_log_transform()`: `log1p(clip(x, 0))` cho 9 heavy-tailed features
   - Lý do: **IsolationForest path-length stability** — feature spanning 6+ bậc độ lớn làm uniform random split không đại diện cho mật độ dữ liệu thực; log1p cân bằng lại
-  - XGBoost không bị ảnh hưởng (tree-based, invariant với monotonic transform)
-- `preprocess()`
-  - Pipeline: `SimpleImputer(median)` → `StandardScaler`
-  - Trả về `X_scaled` dạng **DataFrame** (giữ nguyên tên feature) để SHAP và feature importance dùng tên thực
-  - Lưu config vào `preprocessor.pkl`
+- `preprocess()`: Pipeline `SimpleImputer(median)` → `StandardScaler` → trả về `X_if` dạng DataFrame; lưu `preprocessor.pkl`
+
+**Path B — XGBoost**: `X_raw` trực tiếp (không qua impute, không qua scale)
+- XGBoost xử lý NaN natively qua sparsity-aware split finding
+- NaN trong review features (player không có review) là **tín hiệu thực sự**, không phải gap cần fill
+- Invariant với monotonic transform → log1p không có tác dụng
 
 
 ## Tuning & Training
 - `tune_models()` → grid search trên IsolationForest, tối đa hoá ROC-AUC so với y_heuristic → `best_if_params`
 - `train_best_models()` → train IF với `best_if_params`, trả về `(models, scores)`, lưu `best_if.pkl`
-- `train_xgboost_semisupervised()`
+- `train_xgboost_semisupervised(X_raw, y_heuristic, y_normal, ...)`
   - Chỉ train trên **confident subset**: heuristic_bot == 1 OR heuristic_normal == 1 (bỏ grey area)
   - `scale_pos_weight` = neg_count / pos_count (xử lý class imbalance)
   - `RandomizedSearchCV` (n_iter=50, cv=5, metric=PR-AUC) → `best_xgb`
-  - Predict_proba chạy trên **toàn bộ** dataset (không chỉ training subset)
+  - Predict_proba chạy trên **toàn bộ** X_raw (không chỉ training subset)
   - Lưu `best_xgb.pkl`, `xgb_tuning_results.csv`
 
 
@@ -176,7 +171,7 @@ Output: `data/processed/*.parquet` (history, players, reviews, purchased)
     - Lưu `xgb_pr_curve.png`, `xgb_feature_importance.png`
   - So sánh mean features: top-50 flagged vs normal → lưu `top50_flagged_profiles.csv`
 - `_shap_plots()`:
-  - Sample 5000 rows ngẫu nhiên từ X_scaled
+  - Sample 5000 rows ngẫu nhiên từ `X_raw` (unscaled — giữ axis values trên thang đo gốc, dễ đọc)
   - Tính SHAP values via native XGBoost `booster.predict(pred_contribs=True)` (bypass TreeExplainer parser)
   - Lưu `shap_summary.png` → global feature importance
   - Lưu `shap_waterfall.png` → player đáng ngờ nhất trong sample
