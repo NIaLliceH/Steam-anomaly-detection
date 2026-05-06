@@ -174,12 +174,14 @@ def tune_models(X_scaled: pd.DataFrame,
 # ---------------------------------------------------------------------------
 
 def train_xgboost_semisupervised(
-        X_raw: pd.DataFrame,
-        y_heuristic: pd.Series,
-        y_normal: pd.Series,
+        X_raw_train: pd.DataFrame,
+        X_raw_test: pd.DataFrame,
+        y_heuristic_train: pd.Series,
+        y_heuristic_test: pd.Series,
+        y_normal_train: pd.Series,
         outputs_dir: str) -> tuple:
     """
-    Train XGBoost using Positive-Unlabeled (PU) Learning logic.
+    Train XGBoost using Positive-Unlabeled (PU) Learning logic on training set only.
 
     XGBoost receives raw (unscaled, unimputed) features directly:
       - XGBoost handles NaN natively via its sparsity-aware split finding;
@@ -194,29 +196,25 @@ def train_xgboost_semisupervised(
     The ambiguous grey area is excluded to avoid noisy labels polluting the
     decision boundary.
 
-    Prediction (predict_proba) runs on the ENTIRE dataset so every player
-    receives an anomaly score for ensemble scoring.
+    Prediction (predict_proba) runs on both train and test sets separately
+    to allow evaluation on unseen test data.
 
-    Returns (best_xgb, xgb_proba_full, common_ids).
+    Returns (best_xgb, xgb_proba_train, xgb_proba_test).
     """
     log.info("Step 5b — XGBoost PU-Learning training (raw features, no scaling) …")
 
-    common_ids  = X_raw.index.intersection(y_heuristic.index)
-    X_all       = X_raw.loc[common_ids]          # full set (for scoring)
-    y_bot_all   = y_heuristic.loc[common_ids]
-    y_norm_all  = y_normal.reindex(common_ids).fillna(0).astype(int)
-
-    # ── PU filter: keep only rows confidently labelled bot OR normal ──────────
-    pu_mask = (y_bot_all == 1) | (y_norm_all == 1)
-    X_train = X_all.loc[pu_mask]
-    y_train = y_bot_all.loc[pu_mask]   # 1=bot, 0=normal (grey area removed)
+    # Prepare training data (train set only)
+    y_norm_train = y_normal_train.fillna(0).astype(int)
+    pu_mask_train = (y_heuristic_train == 1) | (y_norm_train == 1)
+    X_train = X_raw_train.loc[pu_mask_train]
+    y_train = y_heuristic_train.loc[pu_mask_train]   # 1=bot, 0=normal (grey area removed)
 
     pos_count = int(y_train.sum())
     neg_count = int((y_train == 0).sum())
-    log.info("  Full set: %d players", len(X_all))
+    log.info("  Train set: %d players", len(X_raw_train))
     log.info("  PU training set: %d players (bot=%d, confirmed_normal=%d)",
              len(y_train), pos_count, neg_count)
-    log.info("  Grey area excluded: %d players", int((~pu_mask).sum()))
+    log.info("  Grey area excluded: %d players", int((~pu_mask_train).sum()))
 
     scale_pos_weight = neg_count / max(pos_count, 1)
     log.info("  Class imbalance ratio (scale_pos_weight): %.2f", scale_pos_weight)
@@ -260,15 +258,16 @@ def train_xgboost_semisupervised(
 
     best_xgb = search.best_estimator_
 
-    # Score ALL players (not just the training subset)
-    xgb_proba_full = best_xgb.predict_proba(X_all)[:, 1]
+    # Score train and test sets separately
+    xgb_proba_train = best_xgb.predict_proba(X_raw_train)[:, 1]
+    xgb_proba_test = best_xgb.predict_proba(X_raw_test)[:, 1]
 
     joblib.dump(best_xgb, os.path.join(outputs_dir, "best_xgb.pkl"))
     pd.DataFrame(search.cv_results_).to_csv(
         os.path.join(outputs_dir, "xgb_tuning_results.csv"), index=False
     )
 
-    return best_xgb, xgb_proba_full, common_ids
+    return best_xgb, xgb_proba_train, xgb_proba_test
 
 
 # ---------------------------------------------------------------------------
@@ -298,14 +297,18 @@ def train_best_models(X_scaled: pd.DataFrame,
 def build_ensemble(scores: dict,
                    common_ids: pd.Index,
                    y_heuristic: pd.Series,
-                   xgb_proba: np.ndarray | None = None) -> tuple[pd.DataFrame, dict]:
+                   xgb_proba: np.ndarray | None = None,
+                   dataset_type: str = "full") -> tuple[pd.DataFrame, dict]:
     """
     Percentile-rank each model (0–100, higher = more suspicious).
 
     Weights: XGB=0.70 (primary), IF=0.30 (secondary).
     Anomaly flag: composite_score >= 85 (high-confidence threshold).
+    
+    Parameters:
+      dataset_type: "train", "test", or "full" for logging purposes
     """
-    log.info("Step 7 — Building ensemble (Dynamic Duo: XGB + IF) …")
+    log.info("Step 7 — Building ensemble [%s] (Dynamic Duo: XGB + IF) …", dataset_type.upper())
     if_scores = scores["IsolationForest"]
     # Negate score_samples so higher value = more anomalous (matches XGBoost convention).
     if_pct    = rankdata(if_scores) / len(if_scores) * 100
@@ -315,7 +318,7 @@ def build_ensemble(scores: dict,
 
     if xgb_proba is not None:
         xgb_pct   = rankdata(xgb_proba) / len(xgb_proba) * 100
-        composite = 0.65 * xgb_pct + 0.35 * if_pct
+        composite = 0.25 * xgb_pct + 0.75 * if_pct
         xgb_flag  = (xgb_pct >= 95).astype(int)
     else:
         xgb_pct   = np.zeros(len(if_pct))
@@ -359,6 +362,7 @@ def tune_ensemble_weights(
     outputs_dir: str,
     step: float = 0.05,
     anomaly_threshold: float = 85.0,
+    dataset_type: str = "full",
 ) -> pd.DataFrame:
     """
     Sweep XGBoost ensemble weight from 0.0 → 1.0 in increments of `step` and
@@ -376,8 +380,8 @@ def tune_ensemble_weights(
 
     Outputs
     -------
-    outputs/ensemble_weight_metrics.csv  — full metric table
-    outputs/plots/ensemble_weight_tuning.png — dual-axis line chart
+    outputs/ensemble_weight_metrics_{dataset_type}.csv  — full metric table
+    outputs/plots/ensemble_weight_tuning_{dataset_type}.png — dual-axis line chart
 
     Parameters
     ----------
@@ -387,6 +391,7 @@ def tune_ensemble_weights(
     outputs_dir       : root outputs directory
     step              : grid step for xgb_weight (default 0.05)
     anomaly_threshold : composite_score cut-off for is_anomaly flag (default 85)
+    dataset_type      : "train", "test", or "full" for output file naming
 
     Returns
     -------
@@ -398,7 +403,7 @@ def tune_ensemble_weights(
     import matplotlib.pyplot as plt
     from sklearn.metrics import average_precision_score
 
-    log.info("Ensemble weight tuning — sweeping xgb_weight 0.0 → 1.0 (step=%.2f) …", step)
+    log.info("Ensemble weight tuning [%s] — sweeping xgb_weight 0.0 → 1.0 (step=%.2f) …", dataset_type.upper(), step)
 
     y_vals = y_heuristic.values  # numpy view for vectorised ops
 
@@ -458,7 +463,8 @@ def tune_ensemble_weights(
     )
 
     # ── Save CSV ────────────────────────────────────────────────────────────
-    csv_path = os.path.join(outputs_dir, "ensemble_weight_metrics.csv")
+    csv_name = f"ensemble_weight_metrics_{dataset_type}.csv" if dataset_type != "full" else "ensemble_weight_metrics.csv"
+    csv_path = os.path.join(outputs_dir, csv_name)
     metrics_df.to_csv(csv_path, index=False)
     log.info("  Saved metric table → %s", csv_path)
 
@@ -522,7 +528,8 @@ def tune_ensemble_weights(
     )
     plt.tight_layout()
 
-    plot_path = os.path.join(plots_dir, "ensemble_weight_tuning.png")
+    plot_name = f"ensemble_weight_tuning_{dataset_type}.png" if dataset_type != "full" else "ensemble_weight_tuning.png"
+    plot_path = os.path.join(plots_dir, plot_name)
     plt.savefig(plot_path, dpi=150)
     plt.close()
     log.info("  Saved dual-axis chart → %s", plot_path)

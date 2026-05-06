@@ -17,8 +17,10 @@ import logging
 import os
 import sys
 import joblib
+import numpy as np
 import pandas as pd
 from datetime import datetime
+from sklearn.model_selection import train_test_split
 
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "src"))
@@ -110,6 +112,17 @@ def main() -> None:
     original_feature_names = X_raw.columns.tolist()
     log.info("Common players for modelling: %d", len(common_ids))
 
+    # ── Train-Test Split (80-20) for reliable evaluation ──────────────────────
+    train_ids, test_ids = train_test_split(
+        common_ids.tolist(),
+        test_size=0.20,
+        random_state=42,
+        stratify=y_heuristic.values
+    )
+    train_ids = pd.Index(train_ids)
+    test_ids = pd.Index(test_ids)
+    log.info("Train-Test split: %d train (80%%), %d test (20%%)", len(train_ids), len(test_ids))
+
     # ── Path A: IsolationForest — log-transform → impute → scale ─────────────
     # IF uses random splits on individual features; extreme outliers (6+ orders
     # of magnitude) make uniform split sampling unrepresentative of true density.
@@ -127,68 +140,98 @@ def main() -> None:
     # invariant to monotonic transforms, so neither log1p nor scaling helps.
     # X_raw is passed directly to train_xgboost_semisupervised below.
 
-    # ── Step 5a: Hyperparameter Tuning (IsolationForest) ─────────────────────
-    best_if_params, tuning_results = tune_models(X_if, y_heuristic)
+    # ── Step 5a: Hyperparameter Tuning (IsolationForest) — on training set only ──
+    X_if_train = X_if.loc[train_ids]
+    y_heuristic_train = y_heuristic.loc[train_ids]
+    best_if_params, tuning_results = tune_models(X_if_train, y_heuristic_train)
     tuning_path = os.path.join(OUTPUTS_DIR, "tuning_results.csv")
     tuning_results.to_csv(tuning_path, index=False)
     log.info("Saved → %s", tuning_path)
 
-    # ── Step 6: Train Final IsolationForest ──────────────────────────────────
-    models, scores = train_best_models(X_if, best_if_params)
+    # ── Step 6: Train Final IsolationForest — on full training set ──────────────
+    models, scores_train = train_best_models(X_if_train, best_if_params)
+    # Score both train and test
+    if_model_full = models["IsolationForest"]
+    if_scores_train = -if_model_full.score_samples(X_if_train)
+    if_scores_test = -if_model_full.score_samples(X_if.loc[test_ids])
+    log.info("  IF scoring: train=%d, test=%d", len(if_scores_train), len(if_scores_test))
     joblib.dump(models["IsolationForest"], os.path.join(OUTPUTS_DIR, "best_if.pkl"))
     log.info("Saved → %s", os.path.join(OUTPUTS_DIR, "best_if.pkl"))
 
-    # ── Step 5b: XGBoost — raw features (Path B) ─────────────────────────────
-    best_xgb, xgb_proba, _ = train_xgboost_semisupervised(
-        X_raw, y_heuristic, y_normal, OUTPUTS_DIR
+    # ── Step 5b: XGBoost — raw features on training set (Path B) ────────────────
+    X_raw_train = X_raw.loc[train_ids]
+    X_raw_test = X_raw.loc[test_ids]
+    y_heuristic_train = y_heuristic.loc[train_ids]
+    y_heuristic_test = y_heuristic.loc[test_ids]
+    y_normal_train = y_normal.loc[train_ids]
+    best_xgb, xgb_proba_train, xgb_proba_test = train_xgboost_semisupervised(
+        X_raw_train, X_raw_test, y_heuristic_train, y_heuristic_test, y_normal_train, OUTPUTS_DIR
+    )
+    log.info("  XGBoost scoring: train=%d, test=%d", len(xgb_proba_train), len(xgb_proba_test))
+
+    # ── Step 7: Ensemble V2 (on test set only for evaluation) ──────────────────────────
+    ensemble_results_test, percentile_scores_test = build_ensemble(
+        {"IsolationForest": if_scores_test},
+        test_ids,
+        y_heuristic_test,
+        xgb_proba=xgb_proba_test,
+        dataset_type="test"
+    )
+    ensemble_path = os.path.join(OUTPUTS_DIR, "ensemble_results_test.csv")
+    ensemble_results_test.to_csv(ensemble_path, index=False)
+    log.info("Saved test ensemble → %s", ensemble_path)
+
+    # Also build full ensemble for reporting (train + test combined)
+    ensemble_results_full, percentile_scores_full = build_ensemble(
+        {"IsolationForest": np.concatenate([if_scores_train, if_scores_test])},
+        common_ids,
+        y_heuristic,
+        xgb_proba=np.concatenate([xgb_proba_train, xgb_proba_test]),
+        dataset_type="full"
     )
 
-    # ── Step 7: Ensemble V2 ───────────────────────────────────────────────────
-    ensemble_results, percentile_scores = build_ensemble(
-        scores, common_ids, y_heuristic, xgb_proba=xgb_proba
-    )
-    ensemble_path = os.path.join(OUTPUTS_DIR, "ensemble_results.csv")
-    ensemble_results.to_csv(ensemble_path, index=False)
-    log.info("Saved → %s", ensemble_path)
-
-    # ── Step 7b: Ensemble Weight Tuning ──────────────────────────────────────
+    # ── Step 7b: Ensemble Weight Tuning (on test set only) ────────────────────────────────
     tune_ensemble_weights(
-        xgb_pct     = percentile_scores["xgb_pct"],
-        if_pct      = percentile_scores["if_pct"],
-        y_heuristic = y_heuristic,
+        xgb_pct     = percentile_scores_test["xgb_pct"],
+        if_pct      = percentile_scores_test["if_pct"],
+        y_heuristic = y_heuristic_test,
         outputs_dir = OUTPUTS_DIR,
+        dataset_type="test"
     )
 
     # ── Active Learning: export high-conflict cases for human review ──────────
     # generate_review_sample(ensemble_results, feature_matrix.loc[common_ids], OUTPUTS_DIR)
 
-    # ── Steps 8 & 9: Evaluate + SHAP ──────────────────────────────────────────
+    # ── Steps 8 & 9: Evaluate + SHAP (on test set for honest metrics) ──────────────
     evaluate(
-        ensemble_results       = ensemble_results,
-        percentile_scores      = percentile_scores,
-        y_heuristic            = y_heuristic,
-        feature_matrix         = feature_matrix.loc[common_ids],
+        ensemble_results       = ensemble_results_test,
+        percentile_scores      = percentile_scores_test,
+        y_heuristic            = y_heuristic_test,
+        feature_matrix         = feature_matrix.loc[test_ids],
         feature_names          = feature_names,
-        X_raw                  = X_raw,          # unscaled, for SHAP interpretability
+        X_raw                  = X_raw_test,          # unscaled, for SHAP interpretability
         best_xgb               = best_xgb,
-        xgb_proba              = xgb_proba,
+        xgb_proba              = xgb_proba_test,
         original_feature_names = original_feature_names,
         outputs_dir            = OUTPUTS_DIR,
     )
 
     # --- Save model memory for Streamlit app ---
+    # Use full dataset scores for model_memory (for Streamlit app)
     model_memory = {
         "feature_columns": original_feature_names,
         "baseline_size": int(len(common_ids)),
+        "train_size": int(len(train_ids)),
+        "test_size": int(len(test_ids)),
         "trained_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
         "feature_reference_time": None if pd.isna(feature_reference_time) else pd.Timestamp(feature_reference_time).isoformat(),
         "sorted_raw_scores": {
-            "IsolationForest": list(sorted(scores["IsolationForest"])) if "IsolationForest" in scores else [],
-            "XGBoost": list(sorted(xgb_proba)) if xgb_proba is not None else [],
+            "IsolationForest": list(sorted(np.concatenate([if_scores_train, if_scores_test]))),
+            "XGBoost": list(sorted(np.concatenate([xgb_proba_train, xgb_proba_test]))) if xgb_proba_test is not None else [],
         },
         "raw_scores": {
-            "IsolationForest": list(scores["IsolationForest"]) if "IsolationForest" in scores else [],
-            "XGBoost": list(xgb_proba) if xgb_proba is not None else [],
+            "IsolationForest": list(np.concatenate([if_scores_train, if_scores_test])),
+            "XGBoost": list(np.concatenate([xgb_proba_train, xgb_proba_test])) if xgb_proba_test is not None else [],
         },
     }
     joblib.dump(model_memory, os.path.join(OUTPUTS_DIR, "model_memory.pkl"))
