@@ -71,15 +71,13 @@ Output: `data/processed/*.parquet` (history, players, reviews, purchased)
 - `library_size`
 - `achievement_game_ratio` → games_with_achievements / library_size *(games_with_achievements tính nội bộ, không export)*
 - `top1_game_concentration` → % achievement từ game có nhiều nhất
-- `top3_game_concentration` → % achievement từ 3 game nhiều nhất
-- `game_hhi` → Herfindahl index = Σ(game_proportion²)
 - `avg_achievements_per_game` → total_achievements / games_with_achievements
 
 #### Group D: `_review_features()`
 - `total_reviews`
 - `review_unplayed_ratio` → fraction reviews cho game có playtime == 0
 - `review_duplication_rate` → 1 − (unique_texts / total_reviews)
-- `avg_review_length`, `min_review_length`
+- `avg_review_length`
 
 #### Group E: `_account_age_features()`
 - `days_before_first_achievement` → first_achievement_date − account_created_date
@@ -94,7 +92,7 @@ Output: `data/processed/*.parquet` (history, players, reviews, purchased)
 - `total_playtime_mins` = tổng playtime của các game thuộc B (distinct game, tránh inflate)
 - `playtime_per_achievement` = total_playtime_mins / (B + C)
 
-**Tổng cộng: 25 features**
+**Tổng cộng: 22 features**
 
 
 ### Heuristic labels - `features.py`

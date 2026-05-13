@@ -63,7 +63,7 @@ Sử dụng AND logic để giảm false positives — chỉ flag những tài k
 | **Review Bot** | review_count > 5 AND ach_count == 0 AND unplayed_ratio > 50% AND dup_rate > 50% |
 | **Normal** | ach_count > 10 AND median_interval > 600s (đầu vào PU Learning) |
 
-**25 Features được tính** (`build_feature_matrix` trong `features.py`)
+**22 Features được tính** (`build_feature_matrix` trong `features.py`)
 
 Chia thành 6 nhóm để phát hiện các chiều bất thường:
 
@@ -71,8 +71,8 @@ Chia thành 6 nhóm để phát hiện các chiều bất thường:
 |-----|-------------|---------|
 | **Speed** | 5 | median/std unlock interval, CV, max/day, max/min |
 | **Temporal** | 3 | night_activity_ratio, hour_entropy, activity_density |
-| **Diversity** | 7 | total_ach, library_size, ach_game_ratio, top1/top3_concentration, game_hhi, avg_ach/game |
-| **Review** | 5 | total_reviews, unplayed_ratio, duplication_rate, avg/min_length |
+| **Diversity** | 5 | total_ach, library_size, ach_game_ratio, top1_concentration, avg_ach/game |
+| **Review** | 4 | total_reviews, unplayed_ratio, duplication_rate, avg_length |
 | **Account Age** | 2 | days_before_first_ach, account_age_days |
 | **Playtime** | 3 | zero_playtime_ratio, total_playtime_mins, playtime_per_achievement |
 
@@ -93,7 +93,7 @@ Kiến trúc hiện tại là **XGBoost (primary) + IsolationForest (secondary)*
 ### 3.2 Dynamic Duo Architecture (V3)
 
 ```
-Raw Features (25)
+Raw Features (22)
        │
        ├──────────────────────────┐
        │ Path A — IsolationForest │ Path B — XGBoost

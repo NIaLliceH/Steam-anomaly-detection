@@ -56,14 +56,11 @@ METRIC_EN_LABELS = {
     "library_size": "Total Library Size",
     "achievement_game_ratio": "Achievement-to-Game Ratio",
     "top1_game_concentration": "Top 1 Game Concentration",
-    "top3_game_concentration": "Top 3 Games Concentration",
-    "game_hhi": "Game Concentration Index (HHI)",
     "avg_achievements_per_game": "Avg Achievements/Game",
     "total_reviews": "Total Reviews Submitted",
     "review_unowned_ratio": "Unowned Review Ratio",
     "review_duplication_rate": "Review Duplication Rate",
     "avg_review_length": "Avg Review Length (Chars)",
-    "min_review_length": "Min Review Length (Chars)",
     "days_before_first_achievement": "Days to First Achievement",
     "account_age_days": "Account Age (Days)",
     "total_playtime_mins": "Total Playtime (Mins)",
@@ -732,8 +729,6 @@ def compute_temp_profile(
             gsum = gcounts.sum()
             p = gcounts / gsum
             row["top1_game_concentration"] = float(p.iloc[0])
-            row["top3_game_concentration"] = float(p.iloc[:3].sum())
-            row["game_hhi"] = float((p**2).sum())
             row["avg_achievements_per_game"] = float(gsum / max(1, gcounts.size))
 
     r = pd.DataFrame()
@@ -746,7 +741,6 @@ def compute_temp_profile(
     if not r.empty and "review" in r.columns:
         text_col = r["review"].astype(str)
         row["avg_review_length"] = float(text_col.str.len().mean())
-        row["min_review_length"] = float(text_col.str.len().min())
         unique_n = text_col.nunique(dropna=True)
         row["review_duplication_rate"] = float(1 - (unique_n / len(text_col))) if len(text_col) > 0 else np.nan
 

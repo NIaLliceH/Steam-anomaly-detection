@@ -20,26 +20,99 @@ log = logging.getLogger(__name__)
 # 0 (UTC) so the feature degrades gracefully rather than erroring.
 # ---------------------------------------------------------------------------
 _COUNTRY_UTC_OFFSET: dict[str, int] = {
-    # Americas
+    # Americas — ISO-2
     "US": -5, "CA": -5, "MX": -6,
     "BR": -3, "AR": -3, "CL": -4, "CO": -5, "PE": -5,
-    # Europe (CET/CEST approximated as +1)
+    # Europe — ISO-2
     "GB": 0,  "IE": 0,
     "DE": 1,  "FR": 1,  "PL": 1,  "ES": 1,  "IT": 1,
     "NL": 1,  "BE": 1,  "AT": 1,  "CH": 1,  "CZ": 1,
     "SE": 1,  "NO": 1,  "DK": 1,  "FI": 2,
     "PT": 0,  "RO": 2,  "HU": 1,  "SK": 1,  "HR": 1,
-    # Eastern Europe / Middle East
+    # Eastern Europe / Middle East — ISO-2
     "RU": 3,  "UA": 2,  "BY": 3,  "TR": 3,
     "IL": 2,  "EG": 2,  "SA": 3,  "AE": 4,
-    # Asia-Pacific
+    # Asia-Pacific — ISO-2
     "CN": 8,  "JP": 9,  "KR": 9,
     "TW": 8,  "HK": 8,  "SG": 8,
     "TH": 7,  "VN": 7,  "ID": 7,  "MY": 8,  "PH": 8,
-    "IN": 5,                        # IST = +5:30, approximated
+    "IN": 5,
     "AU": 10, "NZ": 12,
-    # Africa
+    # Africa — ISO-2
     "ZA": 2,  "NG": 1,  "KE": 3,
+    # -----------------------------------------------------------------------
+    # Full country names — players.csv stores full names, not ISO-2 codes.
+    # EDA confirmed: 99.7% of non-null entries are full names (ISO-2 match: 0.3%)
+    # -----------------------------------------------------------------------
+    # Americas — full names
+    "United States": -5, "Canada": -5, "Mexico": -6,
+    "Brazil": -3, "Argentina": -3, "Chile": -4, "Colombia": -5, "Peru": -5,
+    "Venezuela": -4, "Ecuador": -5, "Bolivia": -4, "Paraguay": -4, "Uruguay": -3,
+    # Europe — full names
+    "United Kingdom": 0, "Ireland": 0,
+    "Germany": 1, "France": 1, "Poland": 1, "Spain": 1, "Italy": 1,
+    "Netherlands": 1, "Belgium": 1, "Austria": 1, "Switzerland": 1,
+    "Czech Republic": 1, "Czechia": 1,
+    "Sweden": 1, "Norway": 1, "Denmark": 1, "Finland": 2,
+    "Portugal": 0, "Romania": 2, "Hungary": 1, "Slovakia": 1, "Croatia": 1,
+    "Bulgaria": 2, "Serbia": 1, "Greece": 2, "Slovenia": 1,
+    "Estonia": 2, "Latvia": 2, "Lithuania": 2,
+    "Bosnia and Herzegovina": 1, "North Macedonia": 1, "Albania": 1,
+    "Montenegro": 1, "Kosovo": 1,
+    "Iceland": 0, "Luxembourg": 1, "Malta": 1, "Cyprus": 2,
+    # Eastern Europe / CIS — full names
+    "Russia": 3, "Russian Federation": 3,
+    "Ukraine": 2, "Belarus": 3, "Kazakhstan": 5,
+    "Azerbaijan": 4, "Armenia": 4, "Georgia": 4,
+    "Uzbekistan": 5, "Kyrgyzstan": 6, "Tajikistan": 5, "Turkmenistan": 5,
+    "Moldova": 2,
+    # Middle East — full names
+    "Turkey": 3, "Türkiye": 3, "Israel": 2, "Egypt": 2,
+    "Saudi Arabia": 3, "United Arab Emirates": 4,
+    "Iran": 3, "Iraq": 3, "Jordan": 2, "Lebanon": 2, "Kuwait": 3,
+    "Qatar": 3, "Bahrain": 3, "Oman": 4, "Yemen": 3,
+    # Asia-Pacific — full names
+    "China": 8, "Japan": 9, "South Korea": 9, "Korea, Republic of": 9,
+    "Taiwan": 8, "Hong Kong": 8, "Singapore": 8,
+    "Thailand": 7, "Vietnam": 7, "Indonesia": 7, "Malaysia": 8, "Philippines": 8,
+    "India": 5, "Pakistan": 5, "Bangladesh": 6, "Sri Lanka": 5,
+    "Nepal": 6, "Myanmar": 6,
+    "Australia": 10, "New Zealand": 12,
+    "Mongolia": 8,
+    # Africa — full names
+    "South Africa": 2, "Nigeria": 1, "Kenya": 3,
+    "Egypt": 2, "Morocco": 0, "Algeria": 1, "Tunisia": 1,
+    "Ethiopia": 3, "Ghana": 0, "Tanzania": 3, "Uganda": 3,
+    "Angola": 1, "Congo": 1, "Congo, The Democratic Republic of the": 1,
+    "Gabon": 1, "Niger": 1, "Chad": 1, "Somalia": 3, "Djibouti": 3,
+    "Rwanda": 2, "Zambia": 2, "Mozambique": 2, "Seychelles": 4,
+    # ISO 3166 official/alternative name variants found in data
+    "Iran, Islamic Republic of": 3,
+    "Viet Nam": 7, "VN": 7,
+    "Taiwan, Province of China": 8,
+    "Korea, Democratic People's Republic of": 9,
+    "Moldova, Republic of": 2,
+    "Venezuela, Bolivarian Republic of": -4,
+    "Bolivia, Plurinational State of": -4,
+    "Lao People's Democratic Republic": 7,
+    "Brunei Darussalam": 8,
+    "Macao": 8,
+    # Balkans / small Europe
+    "Bosnia and Herzegovina": 1, "North Macedonia": 1,
+    "Albania": 1, "Montenegro": 1, "San Marino": 1,
+    "Kosovo": 1, "Liechtenstein": 1, "Monaco": 1, "Gibraltar": 0,
+    "Isle of Man": 0, "Greenland": -3,
+    # Middle East / South Asia
+    "Lebanon": 2, "Palestine, State of": 2,
+    "Sri Lanka": 5, "Afghanistan": 4, "Myanmar": 6, "Tajikistan": 5,
+    # Americas — small countries
+    "Jamaica": -5, "Cuba": -5, "Dominican Republic": -4,
+    "Costa Rica": -6, "El Salvador": -6, "Guatemala": -6,
+    "Paraguay": -4, "Suriname": -3, "Cabo Verde": -1,
+    "Puerto Rico": -4, "Virgin Islands, U.S.": -4,
+    "Barbados": -4, "Martinique": -4, "Guadeloupe": -4,
+    # Pacific territories
+    "Fiji": 12, "Cocos (Keeling) Islands": 7, "Christmas Island": 7,
 }
 
 
@@ -189,19 +262,27 @@ def build_heuristic_labels(feature_matrix: pd.DataFrame) -> pd.DataFrame:
 
 def _speed_features(history: pd.DataFrame) -> pd.DataFrame:
     """Group A: unlock speed/rhythm statistics."""
-    h = history.sort_values(["playerid", "date_acquired"])
-    h = h.copy()
-    h["interval_sec"] = (
+    h = history.sort_values(["playerid", "date_acquired"]).copy()
+    h["_prev_gameid"]  = h.groupby("playerid")["gameid"].shift()
+    h["interval_sec"]  = (
         h.groupby("playerid")["date_acquired"]
         .diff()
         .dt.total_seconds()
     )
 
-    speed = h.groupby("playerid")["interval_sec"].agg(
+    # Cross-game transitions only — same-game zero-intervals are Steam chain
+    # reactions (one milestone unlocking multiple achievements simultaneously),
+    # not bot signals. EDA validated: 99.5% of zero-intervals are same-game chains.
+    cross_mask = h["_prev_gameid"].notna() & ~(
+        (h["interval_sec"] == 0) & (h["gameid"] == h["_prev_gameid"])
+    )
+    h_cross = h[cross_mask]
+
+    speed = h_cross.groupby("playerid")["interval_sec"].agg(
         median_unlock_interval_sec="median",
         std_unlock_interval_sec="std",
     )
-    mean_interval = h.groupby("playerid")["interval_sec"].mean()
+    mean_interval = h_cross.groupby("playerid")["interval_sec"].mean()
     speed["cv_unlock_interval"] = (
         speed["std_unlock_interval_sec"]
         / mean_interval.where(mean_interval > 0)
@@ -290,25 +371,17 @@ def _diversity_features(history: pd.DataFrame,
     lib_filled = lib_size.reindex(total_achievements.index).fillna(0)
     ach_game_ratio = (games_with_ach / lib_filled.clip(lower=1)).rename("achievement_game_ratio")
 
-    # Per-game concentration metrics
+    # Per-game concentration metric
     game_counts = history.groupby(["playerid", "gameid"]).size()
     game_totals = game_counts.groupby(level=0).sum()
     game_props  = game_counts / game_totals
 
     top1_conc = game_props.groupby(level=0).max().rename("top1_game_concentration")
-    top3_conc = (
-        game_props.groupby(level=0)
-        .apply(lambda x: x.nlargest(3).sum())
-        .rename("top3_game_concentration")
-    )
-    game_hhi = (
-        (game_props ** 2).groupby(level=0).sum().rename("game_hhi")
-    )
     avg_ach_per_game = (total_achievements / games_with_ach).rename("avg_achievements_per_game")
 
     return pd.concat(
         [total_achievements, lib_size,
-         ach_game_ratio, top1_conc, top3_conc, game_hhi, avg_ach_per_game],
+         ach_game_ratio, top1_conc, avg_ach_per_game],
         axis=1,
     )
     
@@ -442,10 +515,9 @@ def _review_features(reviews: pd.DataFrame,
 
     rev_lens = reviews.assign(rlen=reviews["review"].fillna("").str.len())
     avg_rev_len = rev_lens.groupby("playerid")["rlen"].mean().rename("avg_review_length")
-    min_rev_len = rev_lens.groupby("playerid")["rlen"].min().rename("min_review_length")
 
     return pd.concat(
-        [total_reviews, review_unplayed, review_dup, avg_rev_len, min_rev_len],
+        [total_reviews, review_unplayed, review_dup, avg_rev_len],
         axis=1,
     )
 
@@ -487,7 +559,7 @@ def build_feature_matrix(history: pd.DataFrame,
     The raw history table contains ~196 K distinct players, but ~193 K of them
     have fewer than 10 achievements and would be discarded by the downstream
     PU-learning filter anyway.  Computing Shannon entropy, inter-arrival
-    standard deviation, HHI, and playtime cross-joins for those players wastes
+    standard deviation, concentration metrics, and playtime cross-joins for those players wastes
     significant CPU and RAM.  Trimming *before* any heavy groupby/merge reduces
     the working set by ~98% and cuts wall-clock feature-engineering time
     proportionally.
@@ -546,8 +618,7 @@ def build_feature_matrix(history: pd.DataFrame,
         {"total_reviews": 0,
          "review_unplayed_ratio": 0.0,
          "review_duplication_rate": 0.0,
-         "avg_review_length": 0.0,
-         "min_review_length": 0.0}
+            "avg_review_length": 0.0}
     )
 
     log.info("  Group E: account age features …") # Sửa lại log info
